@@ -1,0 +1,6 @@
+# Unified diff context prefixes are followed by the original tab indentation.
+# Preserve patch bytes for replay instead of treating that syntax as bad code.
+*.patch -text whitespace=-space-before-tab
+
+# Preserve this inherited CRLF test without reporting CR as trailing whitespace.
+integrations/dsh/kixrlm/plugins/kix-commands.test.js whitespace=cr-at-eol

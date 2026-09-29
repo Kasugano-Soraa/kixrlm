@@ -1,0 +1,15 @@
+# Local agent state and task records are never public source.
+.rlm/
+kix-discipline/
+
+# Credentials, installation copies, generated files.
+.env
+.env.*
+!.env.example
+node_modules/
+__pycache__/
+*.py[cod]
+*.log
+.smoke-backup/
+dist/
+.DS_Store

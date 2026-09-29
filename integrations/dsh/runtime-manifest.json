@@ -1,0 +1,53 @@
+{
+  "schemaVersion": 1,
+  "status": "experimental-reference",
+  "observedEnvironment": {
+    "platform": "Linux",
+    "node": "24.21.0",
+    "python": "3.12.3",
+    "git": "2.43.0",
+    "dsh": "0.1.5-rc.2"
+  },
+  "scope": "Observed development environment, not a minimum-version guarantee or a complete host lockfile. Credentials, user settings, installed dependencies and live session state are not included.",
+  "preset": "kixrlm/agent.cordis.yml",
+  "hostPatches": [{"id": "workflow",
+    "package": "@deepseek-ai/dsh-workflow-worker-thread",
+    "version": "0.1.5-rc.2",
+    "file": "host-patches/workflow-0.1.5-rc.2.patch",
+    "automaticallyApplied": false,
+    "sha256": {
+      "lib/index.js": {
+        "before": "6cc60bafcea0450dff962253b008c74aa71ee64e50127fe1ce83c13e38a416e1",
+        "after": "2f39f5c729be46df32a8edbbc7ebe5f370349c05f93756ca6e1b4d4355155208"
+      },
+      "lib/worker.cjs": {
+        "before": "c97c71b48ec4fb4b6cf04f20471d42cf8cda1d034e277aa3c81d49ba9e661d96",
+        "after": "2787ac57161f44ce3d23169bec6ef57c7997f12416d06cd9f83a05c0c54447a2"
+      }
+    }
+  }, {
+    "id": "compaction-cap",
+    "package": "@deepseek-ai/dsh-compaction-basic",
+    "version": "0.1.5-rc.2",
+    "file": "host-patches/compaction-cap-0.1.5-rc.2.patch",
+    "automaticallyApplied": false,
+    "requiredFor": ["maxThresholdTokens", "maxRetainTokens"],
+    "sha256": {
+      "lib/index.js": {
+        "before": "169bc0785d80a10e4d8d43f11a34a15174b60d194ca13bd702b2b139edc44e78",
+        "after": "98a877d0938da1cbbe6cc125a04dd10761e693f109e551a244edf0712647b5ed"
+      }
+    }
+  }],
+  "optionalDependencies": {
+    "browser": "playwright-core and an accessible Chromium/CDP endpoint or local browser binary",
+    "legacyKixpowerScripts": "PowerShell",
+    "crossVendorObservation": "At least two usable model vendors and compatible host routing services"
+  },
+  "notVerified": [
+    "Fresh-machine full DSH composition and real model calls",
+    "Other DSH versions and complete host-patch inventory",
+    "Native integration with non-DSH harnesses",
+    "Native Windows RLM process and signal behavior"
+  ]
+}

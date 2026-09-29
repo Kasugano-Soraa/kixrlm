@@ -1,0 +1,89 @@
+--- a/lib/index.js
++++ b/lib/index.js
+@@ -20,6 +20,8 @@
+ 	"thresholdRatio",
+ 	"retainRatio",
+ 	"retainTokens",
++	"maxThresholdTokens",
++	"maxRetainTokens",
+ 	"summarizationProvider",
+ 	"summarizationModel",
+ 	"maxTokens",
+@@ -67,6 +69,8 @@
+ 	return deepFreeze({
+ 		thresholdRatio,
+ 		...retention,
++		maxThresholdTokens: config.maxThresholdTokens,
++		maxRetainTokens: config.maxRetainTokens,
+ 		summarizationProvider: config.summarizationProvider ?? "",
+ 		summarizationModel: config.summarizationModel ?? "",
+ 		maxTokens: config.maxTokens ?? 8192,
+@@ -91,6 +95,8 @@
+ 			model: target.model
+ 		},
+ 		thresholdRatio: override?.thresholdRatio ?? config.thresholdRatio,
++		maxThresholdTokens: override?.maxThresholdTokens ?? config.maxThresholdTokens,
++		maxRetainTokens: override?.maxRetainTokens ?? config.maxRetainTokens,
+ 		...resolveRetention(override ?? {}, inheritedRetention),
+ 		summarizationProvider: override?.summarizationProvider ?? config.summarizationProvider,
+ 		summarizationModel: override?.summarizationModel ?? config.summarizationModel,
+@@ -108,13 +114,19 @@
+ function resolveCompactSpec(policy, contextWindow) {
+ 	const targetKey = `${policy.target.provider}/${policy.target.model}`;
+ 	if (!Number.isInteger(contextWindow) || contextWindow <= 0) throw new TargetPressureConfigError(targetKey, `BasicCompactionConfig: contextWindow (${contextWindow}) must be a positive integer`);
+-	const thresholdTokens = Math.floor(contextWindow * policy.thresholdRatio);
+-	const retainTokens = policy.retainTokens === void 0 ? Math.floor(contextWindow * policy.retainRatio) : policy.retainTokens;
++	/* kix-cap-patch v2 */
++	// absolute caps win over the ratios; the ratios still bound small windows
++	const ratioThreshold = Math.floor(contextWindow * policy.thresholdRatio);
++	const thresholdTokens = Math.min(policy.maxThresholdTokens ?? Number.POSITIVE_INFINITY, ratioThreshold);
++	const ratioRetain = policy.retainTokens === void 0 ? Math.floor(contextWindow * policy.retainRatio) : policy.retainTokens;
++	const retainTokens = Math.min(policy.maxRetainTokens ?? Number.POSITIVE_INFINITY, ratioRetain);
+ 	if (retainTokens >= thresholdTokens) throw new TargetPressureConfigError(targetKey, `BasicCompactionConfig: ${policy.target.provider}/${policy.target.model} retainTokens (${retainTokens}) must be less than threshold tokens ${thresholdTokens}`);
+ 	return deepFreeze({
+ 		target: { ...policy.target },
+ 		contextWindow,
+ 		thresholdRatio: policy.thresholdRatio,
++		maxThresholdTokens: policy.maxThresholdTokens,
++		maxRetainTokens: policy.maxRetainTokens,
+ 		thresholdTokens,
+ 		retainTokens,
+ 		summarizationProvider: policy.summarizationProvider,
+@@ -166,6 +178,8 @@
+ 	if (thresholdRatio !== void 0) assertRatio(`${name}.thresholdRatio`, thresholdRatio);
+ 	if (retainRatio !== void 0) assertRatio(`${name}.retainRatio`, retainRatio);
+ 	if (retainTokens !== void 0) assertNonNegativeInteger(`${name}.retainTokens`, retainTokens);
++	if (config.maxThresholdTokens !== void 0) assertPositiveInteger(`${name}.maxThresholdTokens`, config.maxThresholdTokens);
++	if (config.maxRetainTokens !== void 0) assertPositiveInteger(`${name}.maxRetainTokens`, config.maxRetainTokens);
+ 	if (retainRatio !== void 0 && retainTokens !== void 0) throw new Error(`${name}: retainRatio and retainTokens are mutually exclusive`);
+ 	if (maxTokens !== void 0) assertPositiveInteger(`${name}.maxTokens`, maxTokens);
+ 	if (compactionRetries !== void 0) assertNonNegativeInteger(`${name}.compactionRetries`, compactionRetries);
+@@ -732,6 +746,10 @@
+ const thresholdRatioSchema = z.number();
+ const retainRatioSchema = z.number();
+ const retainTokensSchema = z.number().step(1).min(0);
++/* kix-cap-patch v2 */
++// absolute caps in tokens; effective budgets are min(cap, ratio * contextWindow)
++const maxThresholdTokensSchema = z.number().step(1).min(1);
++const maxRetainTokensSchema = z.number().step(1).min(1);
+ const summarizationProviderSchema = z.string();
+ const summarizationModelSchema = z.string();
+ const maxTokensSchema = z.number().step(1).min(1);
+@@ -743,6 +761,8 @@
+ 	thresholdRatio: thresholdRatioSchema,
+ 	retainRatio: retainRatioSchema,
+ 	retainTokens: retainTokensSchema,
++	maxThresholdTokens: maxThresholdTokensSchema,
++	maxRetainTokens: maxRetainTokensSchema,
+ 	summarizationProvider: summarizationProviderSchema,
+ 	summarizationModel: summarizationModelSchema,
+ 	maxTokens: maxTokensSchema,
+@@ -767,6 +787,8 @@
+ 		thresholdRatio: thresholdRatioSchema,
+ 		retainRatio: retainRatioSchema,
+ 		retainTokens: retainTokensSchema,
++		maxThresholdTokens: maxThresholdTokensSchema,
++		maxRetainTokens: maxRetainTokensSchema,
+ 		summarizationProvider: summarizationProviderSchema,
+ 		summarizationModel: summarizationModelSchema,
+ 		maxTokens: maxTokensSchema,

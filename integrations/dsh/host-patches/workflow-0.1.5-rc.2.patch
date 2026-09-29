@@ -1,0 +1,184 @@
+--- a/lib/index.js
++++ b/lib/index.js
+@@ -277,11 +277,19 @@
+ 	workerDeathObserved = false;
+ 	cancelReason;
+ 	graceTimer;
++	/** Stall watchdog: 0 disables; armed post-construction by the engine. */
++	stallTimeoutMs = 0;
++	stallTimer;
++	lastActivityAt = Date.now();
++	/** Delegation-depth cap passed to every child start (engine config). */
++	maxDepth;
+ 	worker;
+ 	/** Set on `exit`: the thread is gone, so posting has nowhere to go. */
+ 	workerGone = false;
+-	/** Accepted `child-start` messages — the terminate-path `agentsStarted` (see module doc). */
++	/** Accepted `child-start` messages — retained for admission accounting. */
+ 	hostStarted = 0;
++	/** Published `agent-start` events — the `agentsStarted` the tool reports (pairs with the visible event stream). */
++	agentStartsPublished = 0;
+ 	/** Published children by callId; an entry leaves only after disposal settles. */
+ 	children = /* @__PURE__ */ new Map();
+ 	/** Provider starts that have not yet fulfilled or rejected. */
+@@ -351,7 +359,7 @@
+ 		this.graceTimer = setTimeout(() => {
+ 			this.terminalClaimed = true;
+ 			this.endStrandedAgents();
+-			this.settleResult(this.cancelledResult(this.hostStarted));
++			this.settleResult(this.cancelledResult(this.agentStartsPublished));
+ 			this.worker.terminate();
+ 		}, this.disposeGraceMs);
+ 		this.graceTimer.unref();
+@@ -411,6 +419,7 @@
+ 	}
+ 	onMessage(message) {
+ 		if (this.workerDeathObserved) return;
++		this.lastActivityAt = Date.now();
+ 		switch (message.type) {
+ 			case WorkerToHostType.Ready:
+ 				this.post(HostToWorkerType.Go, {});
+@@ -423,6 +432,7 @@
+ 				break;
+ 			case WorkerToHostType.AgentStart:
+ 				this.liveAgents.set(message.info.seq, message.info);
++				this.agentStartsPublished += 1;
+ 				this.observer.agentStart(message.info);
+ 				break;
+ 			case WorkerToHostType.AgentEnd:
+@@ -489,6 +499,8 @@
+ 				}],
+ 				parent: this.parent,
+ 				signal: this.controller.signal,
++				...request.label !== void 0 ? { label: request.label } : {},
++				...this.maxDepth !== void 0 ? { maxDepth: this.maxDepth } : {},
+ 				...request.schema !== void 0 ? { outputSchema: request.schema } : {},
+ 				...request.provider !== void 0 || request.model !== void 0 ? { agentOptions: {
+ 					...request.provider !== void 0 ? { provider: request.provider } : {},
+@@ -625,15 +637,16 @@
+ 		const cancellationWasRequested = this.cancelReason !== void 0;
+ 		this.terminalClaimed = true;
+ 		this.reapChildren("workflow settled");
++		this.endStrandedAgents();
+ 		if (!cancellationWasRequested) {
+-			this.settleResult(result);
++			this.settleResult({ ...result, agentsStarted: this.agentStartsPublished });
+ 			return;
+ 		}
+ 		if (result.stopReason !== "cancelled") {
+-			this.settleResult(this.cancelledResult(result.agentsStarted));
++			this.settleResult(this.cancelledResult(this.agentStartsPublished));
+ 			return;
+ 		}
+-		this.settleResult(result);
++		this.settleResult({ ...result, agentsStarted: this.agentStartsPublished });
+ 	}
+ 	/** Process an error/messageerror/exit signal; `exit` also performs the final disposal sweep. */
+ 	onWorkerDeath(message, isExit) {
+@@ -644,12 +657,12 @@
+ 			if (!outcomeWasClaimed) this.terminalClaimed = true;
+ 			if (this.children.size > 0 || this.pendingStarts.size > 0) this.reapChildren("workflow worker gone");
+ 			this.endStrandedAgents();
+-			if (!outcomeWasClaimed) if (cancellationWasRequested) this.settleResult(this.cancelledResult(this.hostStarted));
++			if (!outcomeWasClaimed) if (cancellationWasRequested) this.settleResult(this.cancelledResult(this.agentStartsPublished));
+ 			else this.settleResult({
+ 				value: null,
+ 				stopReason: "error",
+ 				error: message,
+-				agentsStarted: this.hostStarted
++				agentsStarted: this.agentStartsPublished
+ 			});
+ 		}
+ 		if (!isExit) return;
+@@ -704,6 +717,31 @@
+ 		signal.removeEventListener("abort", onAbort);
+ 	}
+ 	/** First settle wins; disarms the grace timer and releases the caller signal. */
++	/** A run with no live children and no worker traffic for stallTimeoutMs cannot make progress: cancel it (the cancel grace bounds the settle). */
++	armStallWatchdog() {
++		if (!this.stallTimeoutMs || this.stallTimeoutMs <= 0) return;
++		const interval = Math.min(Math.max(1e3, this.stallTimeoutMs / 2), 6e4);
++		this.lastActivityAt = Date.now();
++		this.stallTimer = setInterval(() => {
++			if (this.settled || this.disposed !== void 0) {
++				this.disarmStallWatchdog();
++				return;
++			}
++			if (this.children.size > 0 || this.pendingStarts.size > 0) {
++				this.lastActivityAt = Date.now();
++				return;
++			}
++			if (Date.now() - this.lastActivityAt < this.stallTimeoutMs) return;
++			this.ctx.logger.warn(`workflow-worker-thread: run stalled (no live children, no worker traffic for ${this.stallTimeoutMs}ms); cancelling`);
++			this.cancel("workflow stalled: no worker activity and no live children");
++		}, interval);
++		this.stallTimer.unref();
++	}
++	disarmStallWatchdog() {
++		if (this.stallTimer === void 0) return;
++		clearInterval(this.stallTimer);
++		this.stallTimer = void 0;
++	}
+ 	settleResult(result) {
+ 		/* v8 ignore next -- defensive fallback outside the claimed state machine */
+ 		if (this.settled) return;
+@@ -711,6 +749,7 @@
+ 		this.settled = true;
+ 		this.detachInputSignal();
+ 		clearTimeout(this.graceTimer);
++		this.disarmStallWatchdog();
+ 		this.settleResolve(result);
+ 	}
+ };
+@@ -852,7 +891,9 @@
+ 		maxTotalAgents: z.natural().min(1).default(1e3),
+ 		maxItemsPerCall: z.natural().min(1).default(4096),
+ 		syncTimeoutMs: z.natural().min(1).default(5e3),
+-		disposeGraceMs: z.natural().default(5e3)
++		disposeGraceMs: z.natural().default(5e3),
++		maxDepth: z.natural().min(0).default(3),
++		stallTimeoutMs: z.natural().min(0).default(6e5)
+ 	});
+ 	config;
+ 	constructor(ctx, config) {
+@@ -907,6 +948,9 @@
+ 				this.emitWorkflowEvent("workflow/agent-end", info, agent);
+ 			}
+ 		}, request.signal);
++		workerRun.maxDepth = this.config.maxDepth;
++		workerRun.stallTimeoutMs = this.config.stallTimeoutMs;
++		workerRun.armStallWatchdog();
+ 		this.emitWorkflowEvent("workflow/start", info);
+ 		workerRun.result.then((settled) => {
+ 			this.emitWorkflowEvent("workflow/end", info, {
+--- a/lib/worker.cjs
++++ b/lib/worker.cjs
+@@ -268,7 +268,20 @@
+ 			throw new _deepseek_ai_dsh_workflow.WorkflowError(`workflow script does not parse: ${String(error)}`, "SCRIPT_PARSE", { cause: error });
+ 		}
+ 		this.context = node_vm.createContext({}, { name: `workflow:${meta.name}` });
++		const renderConsoleValue = (v) => {
++			try {
++				return typeof v === "string" ? v : JSON.stringify(v);
++			} catch {
++				return String(v);
++			}
++		};
+ 		const globals = {
++			console: Object.freeze({
++				log: (...parts) => this.log(parts.map(renderConsoleValue).join(" ")),
++				info: (...parts) => this.log(parts.map(renderConsoleValue).join(" ")),
++				warn: (...parts) => this.log(parts.map(renderConsoleValue).join(" ")),
++				error: (...parts) => this.log(parts.map(renderConsoleValue).join(" "))
++			}),
+ 			agent: (prompt, opts) => this.contain(this.agent(prompt, opts)),
+ 			parallel: (thunks) => this.contain(this.parallel(thunks)),
+ 			pipeline: (items, ...stages) => this.contain(this.pipeline(items, stages)),
+@@ -417,6 +430,7 @@
+ 			try {
+ 				run = await this.children.startAgent({
+ 					prompt: rawPrompt,
++					label,
+ 					...opts.schema !== void 0 ? { schema: opts.schema } : {},
+ 					...opts.provider !== void 0 ? { provider: opts.provider } : {},
+ 					...opts.model !== void 0 ? { model: opts.model } : {}

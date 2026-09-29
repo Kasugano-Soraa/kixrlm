@@ -1,0 +1,1058 @@
+// kix-focus 回归测试（2026-08-16）
+//
+// 单元级验证：加载 kix-focus.js，mock DSH tools 服务（register/restrict/schemas/execute），
+// 覆盖：
+//   - 纯逻辑（__internals）：isOnDemand / projectToolMeta / searchCapabilities /
+//     guidanceText / RESIDENT_TOOLS / CAPABILITY_GROUPS
+//   - 插件挂载：restrict 被调用（裁剪）、search/call 工具注册、pre-execute 引导
+//   - call 代理执行：常驻工具拒绝、未知工具报错、按需工具走 execute
+// 运行：node plugins/kix-focus.test.js
+
+const path = require('node:path')
+const assert = require('node:assert')
+
+// ── mock ctx ───────────────────────────────────────────────────────────────
+const listeners = {}
+// resolvePkg 返回包名字符串本身（mock 的 ctx.plugin 按字符串比较 pkg 判定
+// goal 包注册名；旧实现返回 {fake:...} 对象导致永远匹配不上）
+const configMock = { resolvePkg: (pkgName) => pkgName }
+const registeredTools = []
+let restrictCalls = []
+let executeCalls = []
+let mockSchemas = []          // scope 视图（scope 注册工具）
+let mockGlobalSchemas = []    // 全局视图（MCP 等；scope-local 名不可见）
+// 2026-08-17 视图感知回归防线：真实 DSH 的全局视图查不到 scope-local 名，
+// 旧 mock 不区分视图，曾让「自动激活挂载后复查失败」缺陷在 82 断言全绿下
+// 漏网（WSL2 E2E 实锤：capability_call 报"工具不存在"）。现在 schemas()/
+// get(name) = scope，schemas(undefined)/get(name, undefined) = 全局。
+// 按需激活 spy：ctx.plugin 返回 Fiber 形对象（await 后取 fiber.dispose()）
+const pluginCalls = []
+let disposeCalls = 0
+// 可配置 fiber.state：默认 ACTIVE(2)；非 ACTIVE 回滚路径测试用 fiberStateOverride
+let fiberStateOverride = null
+// ctx.effect 记录（回归防线：激活不得注册自动清理回调——真实 DSH 的工具
+// execute effect 域在调用结束时触发清理，会立即卸载刚激活的插件；mock 的
+// no-op effect 曾让该缺陷在 49 断言全绿下漏网）
+const effectCalls = []
+const serviceMocks = Object.create(null)
+const ctx = {
+  config: configMock,
+  logger: { info() {}, warn() {}, error() {} },
+  get(name) { return serviceMocks[name] },
+  on(event, cb) { (listeners[event] ||= []).push(cb) },
+  effect(cb) { effectCalls.push(cb) },
+  setInterval() { return { clear() {} } },
+  plugin(pkg, cfg) {
+    // 模拟挂载副作用：按 cfg.toolName 注册对应工具（goal 包注册 create_goal 等），
+    // dispose 时移除——自动激活路径依赖"挂载后 tools.get 可见"。
+    const names = cfg && cfg.toolName ? [cfg.toolName]
+      : pkg === '@deepseek-ai/dsh-tool-goal' ? ['create_goal', 'update_goal', 'get_goal']
+      : []
+    pluginCalls.push({ pkg, cfg, names })
+    for (const n of names) if (!mockSchemas.some((s) => s.name === n)) mockSchemas.push({ name: n, description: 'activated ' + n })
+    return {
+      dispose: async () => {
+        disposeCalls++
+        for (const n of names) {
+          const idx = mockSchemas.findIndex((s) => s.name === n)
+          if (idx >= 0) mockSchemas.splice(idx, 1)
+        }
+      },
+      state: fiberStateOverride !== null ? fiberStateOverride : 2,
+    }
+  },
+}
+ctx.tools = {
+  register(def) { registeredTools.push(def); return () => {} },
+  restrict(filter) { restrictCalls.push(filter); return () => {} },
+  // DSH 0.1.2-rc.1 视图语义：
+  // `get(name, scope)`/`schemas(scope)` 中 scope 省略或显式 undefined = 全局视图。
+  // agent 视图 = 自身层 ∪ 未被 restrict deny 的继承全局。restrict 是执行 ACL：
+  // 被 deny 的 mcp__* / 全局 web_search 在 agent 视图读作 absent。
+  // 2026-09-11 前 mock 把 agent 视图做成「scope ∪ 全局、不应用 restrict」，
+  // 导致 capability_call 带 agent execute MCP 的 UNKNOWN_TOOL 单测全绿漏网。
+  schemas(scope) { return scope === undefined ? mockGlobalSchemas : mockSchemas },
+  get(name, scope) {
+    if (scope === undefined) {
+      return mockGlobalSchemas.find((s) => s.name === name) ? { name } : undefined
+    }
+    if (mockSchemas.find((s) => s.name === name)) return { name }
+    // inherited global, minus restrict deny (mcp__* / web_search)
+    if (typeof name === 'string' && (name.startsWith('mcp__') || name === 'web_search')) return undefined
+    return mockGlobalSchemas.find((s) => s.name === name) ? { name } : undefined
+  },
+  async execute(input) {
+    executeCalls.push(input)
+    // Mirror dsh-tools resolveExecution: agent view cannot execute restricted MCP.
+    if (input && input.agent && typeof input.name === 'string' && input.name.startsWith('mcp__')) {
+      return {
+        isError: true,
+        error: { message: `unknown tool "${input.name}"`, info: { name: 'ToolNotFoundError', code: 'UNKNOWN_TOOL' } },
+        content: [{ type: 'text', text: `Error: unknown tool "${input.name}"` }],
+      }
+    }
+    return { isError: false, value: { executed: input.name } }
+  },
+}
+
+// ── 加载被测试插件 ────────────────────────────────────────────────────────
+const plugin = require(path.join(__dirname, 'kix-focus.js'))
+assert.strictEqual(plugin.name, 'kix-focus')
+// 预置工具 schema（apply 时 restrict 需要看到已注册工具；scope 与全局分视图）
+mockSchemas = [
+  { name: 'edit', description: 'Edit' }, { name: 'read', description: 'Read' },
+  { name: 'subagent', description: 'Sub' }, { name: 'ask_user_question', description: 'Ask' },
+  { name: 'subagent_reviewer', description: 'Reviewer' }, { name: 'subagent_qa', description: 'QA' },
+  { name: 'subagent_dev', description: 'Dev' }, { name: 'pwsh', description: 'Shell' },
+  { name: 'workflow', description: 'Flow' },
+  { name: 'job_output', description: 'Job' },
+]
+mockGlobalSchemas = [
+  { name: 'mcp__github__get_issue', description: 'Issue' },
+]
+plugin.apply(ctx, configMock)
+assert.ok(registeredTools.some((t) => t.name === 'kix_capability_search'), 'search 工具已注册')
+assert.ok(registeredTools.some((t) => t.name === 'kix_capability_call'), 'call 工具已注册')
+assert.ok(restrictCalls.length === 1, 'restrict 被调用一次')
+
+const I = plugin.__internals
+const searchTool = registeredTools.find((t) => t.name === 'kix_capability_search')
+const callTool = registeredTools.find((t) => t.name === 'kix_capability_call')
+
+let passed = 0
+let failed = 0
+// 2026-08-17 harness 修复 v2：ok 改 async 并 await cond，全部断言经
+// `await ok(...)` 顺序执行——旧 `if (cond)` 对 Promise 恒真（异步用例
+// 空转 PASS），且并发 pending 收集会让共享态（fiberStateOverride/mockSchemas/
+// pluginCalls）跨用例交错。主流程包进 async IIFE 逐条 await。
+async function ok(label, cond) {
+  const okk = await cond
+  if (okk) { passed++ } else { failed++ }
+  console.log(`${okk ? 'PASS' : 'FAIL'}  ${label}`)
+}
+function section(title) { console.log('\n── ' + title + ' ──') }
+;(async () => {
+
+// ── 1. 纯逻辑：isOnDemand / RESIDENT_TOOLS ────────────────────────────────
+section('isOnDemand / 常驻集')
+await ok('edit 常驻', I.RESIDENT_TOOLS.has('edit'))
+await ok('read 常驻', I.RESIDENT_TOOLS.has('read'))
+await ok('subagent 常驻', I.RESIDENT_TOOLS.has('subagent'))
+await ok('subagent_cross 常驻', I.RESIDENT_TOOLS.has('subagent_cross'))
+await ok('subagent_lite 未挂载(渐进面,默认 disabled)', I.isOnDemand('subagent_lite'))
+await ok('reviewer/qa/dev 为 role-first 常驻成员',
+  ['subagent_reviewer', 'subagent_qa', 'subagent_dev'].every((n) => I.RESIDENT_TOOLS.has(n) && !I.isOnDemand(n)))
+await ok('subagent_fork 未挂载(渐进面,默认 disabled)', I.isOnDemand('subagent_fork'))
+await ok('ask_user_question 常驻', I.RESIDENT_TOOLS.has('ask_user_question'))
+await ok('kix_capability_search 常驻', I.RESIDENT_TOOLS.has('kix_capability_search'))
+await ok('mcp__github__get_issue 按需', I.isOnDemand('mcp__github__get_issue'))
+await ok('web_search 常驻性由 cordis tool-web 行决定（不在 RESIDENT_TOOLS 语义内）', (() => {
+  // web_search 是 preset 行 tool-web 挂载的 scope 工具，常驻/按需由 cordis
+  // 决定，不经 RESIDENT_TOOLS。2026-08-20 三分法回滚：tool-web 恢复常驻，
+  // isOnDemand 语义只服务 kix-focus 自管的工具，web_search 不在其列。
+  return I.isOnDemand('web_search') === true // 语义:非 kix-focus 自管,非 RESIDENT
+    && I.ACTIVATABLE_TOOLS.web_search === undefined
+})())
+await ok('read_image 按需', I.isOnDemand('read_image'))
+await ok('workflow 常驻(临时启用,自发使用测试中)', !I.isOnDemand('workflow'))
+await ok('create_goal 未挂载(默认 disabled,不在常驻集)', I.isOnDemand('create_goal'))
+await ok('job_output 常驻(2026-08-17 jobs 常驻化)', !I.isOnDemand('job_output'))
+await ok('list_agents 常驻(scope 自动可见)', !I.isOnDemand('list_agents'))
+await ok('edit 非按需', !I.isOnDemand('edit'))
+
+// ── 1.5 native sandbox schema 与会话权限一致 ─────────────────────────────
+section('native sandbox schema 投影')
+const sandboxTool = {
+  name: 'bash',
+  description: 'shell',
+  parameters: {
+    type: 'object',
+    required: ['command', 'sandbox_permissions'],
+    properties: {
+      command: { type: 'string' },
+      sandbox_permissions: { type: 'string', enum: ['workspace-write', 'danger-full-access'] },
+      justification: { type: 'string' },
+    },
+  },
+}
+await ok('danger-full-access 删除不可用升级字段且不改原 schema', (() => {
+  const tools = [sandboxTool, { name: 'read', parameters: { properties: {} } }]
+  const projected = I.projectSandboxToolContracts(tools, { mode: 'danger-full-access', approval: 'never' })
+  return projected !== tools
+    && projected[0] !== sandboxTool
+    && !('sandbox_permissions' in projected[0].parameters.properties)
+    && !('justification' in projected[0].parameters.properties)
+    && !projected[0].parameters.required.includes('sandbox_permissions')
+    && 'sandbox_permissions' in sandboxTool.parameters.properties
+    && projected[1] === tools[1]
+})())
+await ok('workspace-write + ask 保留一次性升级 schema', (() => {
+  const tools = [sandboxTool]
+  return I.projectSandboxToolContracts(tools, { mode: 'workspace-write', approval: 'ask' }) === tools
+})())
+await ok('approval never 在较窄模式也删除不可批准字段', (() => {
+  const projected = I.projectSandboxToolContracts([sandboxTool], { mode: 'read-only', approval: 'never' })
+  return !('sandbox_permissions' in projected[0].parameters.properties)
+})())
+await ok('system-prompt waterfall 按当前 session 投影', (async () => {
+  const session = {}
+  serviceMocks.sandboxPolicy = { resolve: ({ session: seen }) => ({ mode: seen === session ? 'danger-full-access' : 'read-only' }) }
+  serviceMocks.approval = {
+    effectivePolicy: (seen) => seen === session ? 'never' : 'ask',
+    overrideOf: () => { throw new Error('effectivePolicy should be authoritative') },
+    config: { policy: 'ask' },
+  }
+  const assembly = { tools: [sandboxTool], sections: [], contexts: [], variables: {} }
+  const handler = listeners['system-prompt/assemble'][0]
+  const projected = await handler(assembly, { agent: { session } }, async () => assembly)
+  delete serviceMocks.sandboxPolicy
+  delete serviceMocks.approval
+  return projected !== assembly
+    && !('sandbox_permissions' in projected.tools[0].parameters.properties)
+})())
+
+// ── 2. 纯逻辑：projectToolMeta ────────────────────────────────────────────
+section('projectToolMeta')
+await ok('投影轻量元数据', (() => {
+  const meta = I.projectToolMeta([
+    { name: 'mcp__github__get_issue', description: 'Get details of an issue', parameters: { properties: { owner: {}, issue_number: {} } } },
+  ])
+  return meta.length === 1 && meta[0].name === 'mcp__github__get_issue'
+    && Array.isArray(meta[0].parameters) && meta[0].parameters.includes('owner')
+    && meta[0].description.length <= 140
+})())
+await ok('nameFilter 过滤', (() => {
+  const meta = I.projectToolMeta([
+    { name: 'mcp__github__get_issue', description: 'x' },
+    { name: 'mcp__playwright__browser_click', description: 'y' },
+  ], 'github')
+  return meta.length === 1 && meta[0].name.includes('github')
+})())
+
+// ── 3. 纯逻辑：searchCapabilities ─────────────────────────────────────────
+section('searchCapabilities')
+const sampleSchemas = [
+  { name: 'mcp__github__get_issue', description: 'Get issue' },
+  { name: 'mcp__github__create_issue', description: 'Create issue' },
+  { name: 'mcp__github__merge_pull_request', description: 'Merge PR' },
+  { name: 'mcp__playwright__browser_click', description: 'Click' },
+  { name: 'mcp__playwright__browser_snapshot', description: 'Snapshot' },
+  { name: 'workflow', description: 'Run workflow' },
+  { name: 'subagent_reviewer', description: 'Reviewer' },
+  { name: 'subagent_qa', description: 'QA' },
+  { name: 'subagent_dev', description: 'Dev' },
+  { name: 'create_goal', description: 'Create goal' },
+  { name: 'job_output', description: 'Job output' },
+  { name: 'skill', description: 'Load a skill' },
+  { name: 'experience', description: 'Crisis-indexed lessons' },
+]
+await ok('空查询返回全部类别', (() => {
+  const r = I.searchCapabilities(sampleSchemas, '')
+  return r.some((g) => g.id === 'github') && r.some((g) => g.id === 'orchestration') && r.some((g) => g.id === 'jobs') && r.some((g) => g.id === 'kix-surface')
+})())
+await ok('查询 github 只返回 github 组', (() => {
+  const r = I.searchCapabilities(sampleSchemas, 'github')
+  return r.every((g) => g.id === 'github') && r[0].toolCount === 3
+})())
+await ok('查询 workflow 返回编排组', (() => {
+  const r = I.searchCapabilities(sampleSchemas, 'workflow')
+  return r.some((g) => g.id === 'orchestration')
+})())
+await ok('单 token skill 命中 kix-surface', (() => {
+  const r = I.searchCapabilities(sampleSchemas, 'skill')
+  return r.some((g) => g.id === 'kix-surface') && r.every((g) => g.id !== 'github')
+})())
+await ok('自然语言多词不再空组', (() => {
+  const r = I.searchCapabilities(sampleSchemas, 'skill experience glm thinking effort DSH model')
+  return r.length > 0 && r.some((g) => g.id === 'kix-surface')
+})())
+await ok('多词仍能按 token 命中 github', (() => {
+  const r = I.searchCapabilities(sampleSchemas, 'kix-focus github issue')
+  return r.some((g) => g.id === 'github') && r.find((g) => g.id === 'github').toolCount === 3
+})())
+await ok('capability_call 只回 kix-surface 不灌全部 MCP', (() => {
+  const r = I.searchCapabilities(sampleSchemas, 'kix_capability_call')
+  return r.length === 1 && r[0].id === 'kix-surface'
+})())
+await ok('queryTokens 拆空白且丢 1 字符', I.queryTokens('skill experience a glm').join(',') === 'skill,experience,glm')
+await ok('组内 exampleTools 截断 3 个', (() => {
+  const r = I.searchCapabilities(sampleSchemas, '')
+  const gh = r.find((g) => g.id === 'github')
+  return gh.exampleTools.length === 3
+})())
+
+// ── 3b. 长尾 fallback 组（2026-08-17 决策：发现面补兜底，不建动态分组）───
+section('fallback 长尾兜底')
+const longTailSchemas = [
+  ...sampleSchemas,
+  { name: 'mcp__linear__get_issue', description: 'Linear issue' }, // 新命名空间 MCP（未归类前缀）
+  { name: 'custom_global_tool', description: 'Custom global' },   // 非 MCP 全局工具（未归类）
+]
+await ok('未覆盖按需工具自动归入 fallback 组', (() => {
+  const r = I.searchCapabilities(longTailSchemas, '')
+  const fb = r.find((g) => g.id === 'other')
+  return fb !== undefined
+    && fb.toolCount === 2
+    && fb.exampleTools.includes('mcp__linear__get_issue')
+    && fb.exampleTools.includes('custom_global_tool')
+})())
+await ok('已覆盖工具与常驻工具不进 fallback', (() => {
+  const r = I.searchCapabilities(longTailSchemas, '')
+  const fb = r.find((g) => g.id === 'other')
+  return fb.exampleTools.every((n) =>
+    !n.startsWith('mcp__github__') && !n.startsWith('mcp__playwright__')
+    && n !== 'workflow' && n !== 'create_goal' && n !== 'job_output')
+})())
+await ok('fallback query 过滤按成员名（组级统计不变）', (() => {
+  const r = I.searchCapabilities(longTailSchemas, 'linear')
+  const fb = r.find((g) => g.id === 'other')
+  return fb !== undefined && fb.toolCount === 2
+})())
+
+// ── 3c. matchedToolMeta（2026-08-17，外部审查 5.6：search 结果带参数名）────
+section('search 带工具元数据（参数名披露）')
+const metaSchemas = [
+  { name: 'mcp__github__get_issue', description: 'Get issue', parameters: { properties: { owner: {}, repo: {}, issue_number: {} } } },
+  { name: 'mcp__github__get_pull_request', description: 'Get PR', parameters: { properties: { owner: {}, pull_number: {} } } },
+  { name: 'mcp__github__create_issue', description: 'Create issue', parameters: { properties: { owner: {}, title: {} } } },
+  { name: 'mcp__playwright__browser_click', description: 'Click', parameters: { properties: { target: {} } } },
+]
+await ok('query 命中 → matchedTools 带 name/description/参数名', (() => {
+  const r = I.searchCapabilities(metaSchemas, 'issue')
+  const gh = r.find((g) => g.id === 'github')
+  return gh !== undefined && Array.isArray(gh.matchedTools)
+    && gh.matchedTools.some((m) => m.name === 'mcp__github__get_issue'
+      && m.parameters.includes('owner') && m.parameters.includes('issue_number')
+      && typeof m.description === 'string')
+})())
+await ok('query 命中 PR → matchedTools 含 pull_number 参数', (() => {
+  const r = I.searchCapabilities(metaSchemas, 'pull_request')
+  const gh = r.find((g) => g.id === 'github')
+  return gh !== undefined && gh.matchedTools.some((m) => m.name === 'mcp__github__get_pull_request'
+    && m.parameters.includes('pull_number'))
+})())
+await ok('空 query（目录浏览模式）不投影 matchedTools（token 成本控制）', (() => {
+  const r = I.searchCapabilities(metaSchemas, '')
+  return r.every((g) => g.matchedTools === undefined)
+})())
+await ok('matchedTools 每组上限 5', (() => {
+  const many = Array.from({ length: 8 }, (_, i) => ({ name: `mcp__github__tool_${i}_issue`, description: 'd', parameters: { properties: { x: {} } } }))
+  const r = I.searchCapabilities(many, 'issue')
+  const gh = r.find((g) => g.id === 'github')
+  return gh !== undefined && gh.matchedTools.length === 5
+})())
+await ok('query 无命中 → 组不带 matchedTools（不返回空数组）', (() => {
+  const r = I.searchCapabilities(metaSchemas, 'zzz_no_match')
+  const gh = r.find((g) => g.id === 'github')
+  return gh === undefined || gh.matchedTools === undefined
+})())
+await ok('新命名空间工具仍可被 call 代理（执行面动态,无需注册）', (async () => {
+  mockSchemas = longTailSchemas.filter((s) => !s.name.startsWith('mcp__') && s.name !== 'custom_global_tool').map((s) => ({ ...s, parameters: { properties: { a: {} } } }))
+  mockGlobalSchemas = longTailSchemas.filter((s) => s.name.startsWith('mcp__') || s.name === 'custom_global_tool').map((s) => ({ ...s, parameters: { properties: { a: {} } } }))
+  executeCalls = []
+  const r = await callTool.execute({ tool: 'mcp__linear__get_issue', arguments: {} })
+  return r.ok === true && r.tool === 'mcp__linear__get_issue' && executeCalls.length === 1
+})())
+
+// ── 4. guidanceText ────────────────────────────────────────────────────────
+section('guidanceText')
+await ok('引导文本含工具名', I.guidanceText('mcp__github__x').includes('mcp__github__x'))
+await ok('引导文本提示 capability_call', I.guidanceText('x').includes('kix_capability_call'))
+
+// ── 5. 插件行为：search 工具 execute ─────────────────────────────────────
+section('kix_capability_search.execute')
+mockSchemas = [
+  ...sampleSchemas.filter((s) => !s.name.startsWith('mcp__')).map((s) => ({ ...s, parameters: { properties: { a: {} } } })),
+  { name: 'edit', description: 'Edit', parameters: { properties: {} } }, // 常驻 scope 工具（capability_call 应拒绝）
+]
+mockGlobalSchemas = sampleSchemas.filter((s) => s.name.startsWith('mcp__')).map((s) => ({ ...s, parameters: { properties: { a: {} } } }))
+await ok('search 返回分组统计', (async () => {
+  const r = await searchTool.execute({ query: 'github' })
+  return r.ok === true && r.onDemandToolCount > 0 && r.groups.some((g) => g.id === 'github')
+})())
+await ok('search 空查询返回统计', (async () => {
+  const r = await searchTool.execute({ query: '' })
+  return r.ok === true && r.residentToolCount > 0 && r.onDemandToolCount > 0
+})())
+
+// ── 6. 插件行为：call 工具 execute ────────────────────────────────────────
+section('kix_capability_call.execute')
+await ok('代理调用按需工具 → execute 走管线', (async () => {
+  executeCalls = []
+  const r = await callTool.execute({ tool: 'mcp__github__get_issue', arguments: { owner: 'o', repo: 'r', issue_number: 1 } })
+  return r.ok === true && r.tool === 'mcp__github__get_issue'
+    && executeCalls.length === 1 && executeCalls[0].name === 'mcp__github__get_issue'
+})())
+await ok('嵌套调用传播 rootCallId（同一执行树）', (async () => {
+  executeCalls = []
+  await callTool.execute({ tool: 'mcp__github__get_issue', arguments: { owner: 'o' } }, { agent: { id: 'a' }, rootCallId: 'root-123', signal: undefined })
+  return executeCalls.length === 1 && executeCalls[0].rootCallId === 'root-123'
+})())
+await ok('DSH 0.1.2-rc.1: restrict MCP 代理 execute 省略 agent', (async () => {
+  executeCalls = []
+  const r = await callTool.execute(
+    { tool: 'mcp__github__get_issue', arguments: { owner: 'o', repo: 'r', issue_number: 1 } },
+    { agent: { id: 'a' }, rootCallId: 'root-mcp' },
+  )
+  return r.ok === true
+    && executeCalls.length === 1
+    && executeCalls[0].name === 'mcp__github__get_issue'
+    && executeCalls[0].agent === undefined
+    && executeCalls[0].rootCallId === 'root-mcp'
+})())
+await ok('scope 工具代理仍带 agent', (async () => {
+  executeCalls = []
+  const r = await callTool.execute(
+    { tool: 'subagent_qa', arguments: { prompt: 'ping' } },
+    { agent: { id: 'a' } },
+  )
+  return r.ok === true && executeCalls.length === 1 && executeCalls[0].agent && executeCalls[0].agent.id === 'a'
+})())
+await ok('代理调用 scope 常驻工具(job_output) → 拒绝', (async () => {
+  // scope 工具只在 agent 视图可见——必须带 exec.agent（真实运行时 executor 总会提供）
+  const r = await callTool.execute({ tool: 'job_output', arguments: {} }, { agent: { id: 'a' } })
+  return r.ok === false && String(r.error).includes('常驻')
+})())
+await ok('代理调用常驻工具 → 拒绝', (async () => {
+  const r = await callTool.execute({ tool: 'edit', arguments: {} }, { agent: { id: 'a' } })
+  return r.ok === false && String(r.error).includes('常驻')
+})())
+await ok('代理调用未知工具 → 报错', (async () => {
+  const r = await callTool.execute({ tool: 'nonexistent_tool', arguments: {} })
+  return r.ok === false && String(r.error).includes('不存在')
+})())
+await ok('缺 tool 名 → 报错', (async () => {
+  const r = await callTool.execute({})
+  return r.ok === false && String(r.error).includes('tool')
+})())
+
+// ── 7. 无 pre-execute 感知拦截（capability_call 内部子调用必须放行）──────
+section('感知设计（不挂 pre-execute deny）')
+await ok('不注册 pre-execute 拦截监听器', (() => {
+  const pe = listeners['tools/pre-execute']
+  return pe === undefined || pe.length === 0
+})())
+await ok('guidanceText 仍导出（供文档/返回使用）', I.guidanceText('x').includes('kix_capability_call'))
+
+// ── 8. restrict 裁剪校验 ──────────────────────────────────────────────────
+section('restrict 裁剪')
+await ok('output.schema.type 合法(JsonSchemaType 枚举,防挂载失败回归)', (() => {
+  const valid = ['object', 'array', 'string', 'number', 'integer', 'boolean', 'null']
+  return registeredTools.every((t) => t.output && t.output.schema && valid.includes(t.output.schema.type))
+})())
+await ok('parameters 含顶层 type:object(register 原样投影,防 type:null 回归)', (() => {
+  return registeredTools.every((t) => t.parameters && t.parameters.type === 'object' && t.parameters.properties !== undefined)
+})())
+await ok('restrict deny 裁剪 MCP 全局工具(deny 模式,allow 在 web 架构失效)', (() => {
+  const deny = restrictCalls[0].deny
+  return Array.isArray(deny) && deny.includes('mcp__github__get_issue')
+})())
+await ok('restrict deny 不含 web_search（scope-local 工具裁不到，2026-08-20 修正）', (() => {
+  // 曾 mock 把 web_search 塞进全局视图断言 deny 含它——假绿：tool-web 是
+  // preset 行注册（scope-local），restrict 只作用于全局工具，deny 从未生效。
+  // web_search 移出注入走 ACTIVATABLE_TOOLS 激活（见下），不再依赖 restrict。
+  const deny = restrictCalls[0].deny
+  return Array.isArray(deny) && !deny.includes('web_search')
+})())
+await ok('restrict deny 不含 scope-local 工具', (() => {
+  const deny = restrictCalls[0].deny
+  const scopeLocals = ['subagent', 'subagent_cross', 'subagent_lite', 'kix_capability_search', 'kix_capability_call', 'edit', 'read', 'pwsh']
+  return deny.every((n) => !scopeLocals.includes(n))
+})())
+await ok('增量 deny:tools/change 后新注册 mcp__ 工具被追加', (() => {
+  // 模拟 MCP 晚注册:全局视图追加 semgrep 工具 → 触发 tools/change
+  mockGlobalSchemas.push({ name: 'mcp__semgrep__deprecation_notice', description: 'Deprecated' })
+  const before = restrictCalls.length
+  ;(listeners['tools/change'] || []).forEach((cb) => cb())
+  const last = restrictCalls[restrictCalls.length - 1]
+  return restrictCalls.length === before + 1
+    && Array.isArray(last.deny) && last.deny.includes('mcp__semgrep__deprecation_notice')
+    && !last.deny.includes('mcp__github__get_issue') // 增量:不重复 deny 已覆盖的
+})())
+await ok('RESTRICT_ALLOW 全部是全局工具名', (() => {
+  const scopeLocals = ['subagent', 'subagent_fork', 'subagent_cross', 'subagent_lite', 'subagent_thinker', 'subagent_vision', 'kix_capability_search', 'kix_capability_call']
+  return I.RESTRICT_ALLOW.every((n) => !scopeLocals.includes(n))
+})())
+await ok('RESIDENT_TOOLS 是 RESTRICT_ALLOW 超集', (() => {
+  return I.RESTRICT_ALLOW.every((n) => I.RESIDENT_TOOLS.has(n))
+})())
+
+// ── 9. 按需激活（kix_tool_activate / kix_tool_deactivate）──────────────────
+section('按需激活')
+const activateTool = registeredTools.find((t) => t.name === 'kix_tool_activate')
+const deactivateTool = registeredTools.find((t) => t.name === 'kix_tool_deactivate')
+await ok('activate/deactivate 工具已注册', activateTool !== undefined && deactivateTool !== undefined)
+await ok('ACTIVATABLE_TOOLS 仅含 workflow/goal/低频档位，常驻成员不重复注册', (() => {
+  return ['workflow', 'goal', 'subagent_lite', 'subagent_thinker', 'subagent_vision', 'subagent_fork']
+    .every((n) => I.ACTIVATABLE_TOOLS[n] && I.ACTIVATABLE_TOOLS[n].package)
+    && ['subagent_reviewer', 'subagent_qa', 'subagent_dev', 'ralph', 'jobs', 'web_search']
+      .every((n) => I.ACTIVATABLE_TOOLS[n] === undefined)
+})())
+await ok('web_search 恢复常驻（三分法回滚：cordis tool-web 行已恢复）', I.ACTIVATABLE_TOOLS.web_search === undefined)
+await ok('所有动态 subagent 档位 maxDepth=2', (() => {
+  return ['subagent_lite', 'subagent_thinker', 'subagent_vision', 'subagent_fork']
+    .every((n) => I.ACTIVATABLE_TOOLS[n].config.maxDepth === 2)
+})())
+await ok('动态非 lite 档位携静态 9-name toolFilter deny', (() => {
+  const expected = ['exit_plan_mode', 'subagent', 'subagent_cross', 'interrupt_agent', 'send_message', 'list_agents', 'ask_user_question', 'kix_tool_activate', 'kix_tool_deactivate']
+  return ['subagent_thinker', 'subagent_vision', 'subagent_fork']
+    .every((n) => JSON.stringify(I.ACTIVATABLE_TOOLS[n].config.toolFilter && I.ACTIVATABLE_TOOLS[n].config.toolFilter.deny) === JSON.stringify(expected))
+    && I.ACTIVATABLE_TOOLS.subagent_lite.config.toolFilter.allow.length === 4
+    && I.ACTIVATABLE_TOOLS.subagent_lite.config.toolFilter.deny === undefined
+})())
+await ok('成员发现组明确 role-first、动态 reviewer lens 与 generic Explore 边界', (() => {
+  const g = I.CAPABILITY_GROUPS.find((x) => x.id === 'subagent-tiers')
+  return !!g && g.hint.includes('常驻可直接调用') && g.hint.includes('generic subagent 仅无归属 Explore')
+    && g.hint.includes('不预设人数') && g.hint.includes('每路不同 lens')
+    && g.hint.includes('cross 是厂商独立维度')
+})())
+await ok('常驻成员不会进入动态激活/卸载枚举', (() => {
+  const text = activateTool.parameters.properties.tool.description + '\n' + deactivateTool.parameters.properties.tool.description
+  return ['subagent_reviewer', 'subagent_qa', 'subagent_dev'].every((n) => !text.includes(n))
+    && activateTool.description.includes('reviewer/qa/dev 已常驻')
+    && deactivateTool.description.includes('reviewer/qa/dev 与 jobs 常驻')
+})())
+await ok('激活/卸载描述完整枚举 ACTIVATABLE_TOOLS（枚举 bug 回归防线：reviewer 曾漏）', (() => {
+  const names = Object.keys(I.ACTIVATABLE_TOOLS)
+  const actParam = activateTool.parameters.properties.tool.description
+  const deaParam = deactivateTool.parameters.properties.tool.description
+  // workflow 依赖 isolate realm 动态激活不可用 → 永不进入 activated 集合，
+  // deactivate 不枚举它（激活描述仍提及并说明原因）。
+  return names.every((n) => n === 'workflow'
+    ? activateTool.description.includes(n)
+    : activateTool.description.includes(n) && actParam.includes(n) && deaParam.includes(n))
+})())
+await ok('subagent_lite 激活配置含 toolName/toolFilter', (() => {
+  const c = I.ACTIVATABLE_TOOLS.subagent_lite.config
+  return c.toolName === 'subagent_lite' && Array.isArray(c.toolFilter.allow) && c.agentOptions.maxTokens === 8192
+})())
+await ok('jobs 已移出可激活清单（2026-08-17 常驻化，动态挂载会冲突）', I.ACTIVATABLE_TOOLS.jobs === undefined)
+await ok('activationNote 文本引导 deactivate', I.activationNote('workflow').includes('kix_tool_deactivate'))
+await ok('激活未知工具 → 报错', (async () => {
+  const r = await activateTool.execute({ tool: 'nonexistent' })
+  return r.ok === false && String(r.error).includes('不可按需激活')
+})())
+await ok('激活 workflow → ctx.plugin 挂载', (async () => {
+  pluginCalls.length = 0
+  const before = effectCalls.length
+  const r = await activateTool.execute({ tool: 'workflow' })
+  return r.ok === true && r.tool === 'workflow'
+    && pluginCalls.length === 1 && pluginCalls[0].cfg && pluginCalls[0].cfg.subagentProvider === undefined
+    && effectCalls.length === before // 回归防线：激活不得注册自动清理 effect
+})())
+await ok('激活 fiber 非 ACTIVE(PENDING,依赖服务不可达) → 回滚并报错', (async () => {
+  fiberStateOverride = 0 // PENDING
+  const beforeDispose = disposeCalls
+  // 用尚未激活的 subagent_lite（workflow 已在上个用例激活，会命中"已激活"分支）
+  const r = await activateTool.execute({ tool: 'subagent_lite' })
+  fiberStateOverride = null
+  return r.ok === false && String(r.error).includes('未生效')
+    && disposeCalls === beforeDispose + 1 // 回滚：dispose 被调
+    && r.tool === 'subagent_lite'
+})())
+await ok('重复激活 → 拒绝', (async () => {
+  const r = await activateTool.execute({ tool: 'workflow' })
+  return r.ok === false && String(r.error).includes('已激活')
+})())
+await ok('deactivate 未激活的工具 → 报错', (async () => {
+  const r = await deactivateTool.execute({ tool: 'goal' })
+  return r.ok === false && String(r.error).includes('未激活')
+})())
+// v5.10 延迟卸载（㉔ 机制化）：deactivate 入队不立即 dispose；回合边界统一执行。
+async function flushTurn() {
+  for (const cb of listeners['agent/turn-stopping'] || []) await cb({})
+}
+await ok('deactivate 已激活 → 延迟（立即不 dispose，返回 deferred）', (async () => {
+  const before = disposeCalls
+  const r = await deactivateTool.execute({ tool: 'workflow' })
+  return r.ok === true && r.deferred === true && disposeCalls === before
+})())
+await ok('待卸载期间重新激活 → 取消卸载、复用 fiber（不重复挂载）', (async () => {
+  pluginCalls.length = 0
+  const r = await activateTool.execute({ tool: 'workflow' })
+  return r.ok === true && pluginCalls.length === 0 && String(r.note).includes('卸载已取消')
+})())
+await ok('deactivate → 回合边界 flush 才真正 dispose', (async () => {
+  const before = disposeCalls
+  await deactivateTool.execute({ tool: 'workflow' })
+  const mid = disposeCalls
+  await flushTurn()
+  return mid === before && disposeCalls === before + 1
+})())
+await ok('flush 后重新激活 → 全新挂载', (async () => {
+  pluginCalls.length = 0
+  const r = await activateTool.execute({ tool: 'workflow' })
+  return r.ok === true && pluginCalls.length === 1
+})())
+await ok('激活 goal → 正常挂载', (async () => {
+  pluginCalls.length = 0
+  const r = await activateTool.execute({ tool: 'goal' })
+  return r.ok === true && pluginCalls.length === 1
+})())
+
+// ── 9b. 首次使用自动激活（2026-08-17 决策 A+B：capability_call 代理即挂载）─
+// 用户原则：机械无认知负担的工具常驻（jobs）；有认知负担的工具由机制自动激活
+// （细分档位/goal）——模型无需记住先 kix_tool_activate，激活由机制兜底。
+section('首次使用自动激活（capability_call 代理即挂载）')
+await ok('job_list/job_kill 与 job_output 同为常驻集', !I.isOnDemand('job_list') && !I.isOnDemand('job_kill'))
+await ok('activate/deactivate 描述与参数枚举不含 jobs（常驻化）', (() => {
+  const actParam = activateTool.parameters.properties.tool.description
+  const deaParam = deactivateTool.parameters.properties.tool.description
+  return !actParam.includes('jobs') && !deaParam.includes('jobs') && !activateTool.description.includes(' / jobs')
+})())
+await ok('capability_call 首次调用低频档位 → 自动挂载并执行', (async () => {
+  pluginCalls.length = 0
+  executeCalls = []
+  const before = effectCalls.length
+  // 真实运行时 executor 总会带 exec.agent；agent 视图才看得到 scope 工具
+  const r = await callTool.execute({ tool: 'subagent_thinker', arguments: { prompt: 'think' } }, { agent: { id: 'agent-1' } })
+  return r.ok === true && r.tool === 'subagent_thinker'
+    && r.autoActivated === true && String(r.note).includes('首次使用自动激活')
+    && pluginCalls.length === 1 && pluginCalls[0].cfg.toolName === 'subagent_thinker'
+    && executeCalls.length === 1 && executeCalls[0].name === 'subagent_thinker'
+    && executeCalls[0].agent && executeCalls[0].agent.id === 'agent-1'
+    && effectCalls.length === before
+})())
+await ok('低频档位自动激活后再次代理 → 不再挂载、直接执行', (async () => {
+  pluginCalls.length = 0
+  executeCalls = []
+  const r = await callTool.execute({ tool: 'subagent_thinker', arguments: {} }, { agent: { id: 'agent-1' } })
+  return r.ok === true && r.autoActivated === undefined
+    && pluginCalls.length === 0 && executeCalls.length === 1
+})())
+await ok('activationKeyFor：goal 工具名 → goal 激活键（工具名≠激活名映射）', (() => {
+  return I.activationKeyFor('create_goal') === 'goal'
+    && I.activationKeyFor('update_goal') === 'goal'
+    && I.activationKeyFor('get_goal') === 'goal'
+    && I.activationKeyFor('subagent_qa') === null
+    && I.activationKeyFor('subagent_thinker') === 'subagent_thinker'
+    && I.activationKeyFor('workflow') === 'workflow'
+    && I.activationKeyFor('job_output') === null
+    && I.activationKeyFor('nonexistent') === null
+})())
+await ok('capability_call 首次调用 goal（create_goal）→ 自动挂载并执行', (async () => {
+  // 前置：section 9 已显式激活 goal（activated 键 'goal'，挂载即注册 create_goal）
+  // → 先卸载并 flush 回合边界还原未挂载态，才能测自动激活路径（v5.10 延迟卸载）
+  await deactivateTool.execute({ tool: 'goal' })
+  await flushTurn()
+  pluginCalls.length = 0
+  executeCalls = []
+  const r = await callTool.execute({ tool: 'create_goal', arguments: { objective: 'x' } }, { agent: { id: 'agent-1' } })
+  return r.ok === true && r.autoActivated === true
+    && pluginCalls.length === 1 && pluginCalls[0].pkg === '@deepseek-ai/dsh-tool-goal'
+    && executeCalls.length === 1 && executeCalls[0].name === 'create_goal'
+})())
+await ok('已挂载的常驻工具仍拒绝代理（job_output 常驻）', (async () => {
+  const r = await callTool.execute({ tool: 'job_output', arguments: {} }, { agent: { id: 'agent-1' } })
+  return r.ok === false && String(r.error).includes('常驻')
+})())
+await ok('自动激活后可用 kix_tool_deactivate 卸载（延迟语义）', (async () => {
+  const before = disposeCalls
+  const r = await deactivateTool.execute({ tool: 'subagent_thinker' })
+  const mid = disposeCalls
+  await flushTurn()
+  return r.ok === true && r.deferred === true && mid === before && disposeCalls === before + 1
+})())
+await ok('卸载后再代理调用 → 重新自动挂载', (async () => {
+  pluginCalls.length = 0
+  executeCalls = []
+  const r = await callTool.execute({ tool: 'subagent_thinker', arguments: {} }, { agent: { id: 'agent-1' } })
+  return r.ok === true && r.autoActivated === true && pluginCalls.length === 1
+})())
+await ok('自动激活 fiber 非 ACTIVE → 回滚报错且不执行', (async () => {
+  fiberStateOverride = 0 // PENDING（依赖服务不可达，如 workflow 的 isolate realm）
+  const beforeDispose = disposeCalls
+  executeCalls = []
+  const r = await callTool.execute({ tool: 'subagent_lite', arguments: {} }, { agent: { id: 'agent-1' } })
+  fiberStateOverride = null
+  return r.ok === false && String(r.error).includes('未生效')
+    && disposeCalls === beforeDispose + 1 && executeCalls.length === 0
+})())
+
+// ── 10. 跨平台包解析（2026-08-17 WSL2 E2E 发现的 symlink 部署 bug）────────
+// 场景：dsh 以符号链接安装（/usr/local/bin/dsh → …/dsh/lib/bin.js），Node
+// 模块解析不跟随 symlink → createRequire(argv[1]) 沿错误根解析全部落空。
+// 修复 = 候选根链（argv[1] → realpath → __filename）。此处用临时目录 +
+// symlink（Linux）/ junction（Windows，免管理员）复现该布局做端到端断言。
+section('跨平台包解析（symlink 部署）')
+const fsSync = require('node:fs')
+const osMod = require('node:os')
+await ok('resolveEntryCandidates: entry 首位、插件文件兜底在链内', (() => {
+  // 注意：链内 __filename 是插件模块自己的（kix-focus.js），非本测试文件
+  const c = I.resolveEntryCandidates('/some/entry.js')
+  const pluginFile = path.resolve(__dirname, 'kix-focus.js')
+  return c[0] === '/some/entry.js' && c.includes(pluginFile)
+})())
+await ok('resolveEntryCandidates: 非 symlink entry 去重（realpath 同值不重复）', (() => {
+  const pluginFile = path.resolve(__dirname, 'kix-focus.js')
+  const c = I.resolveEntryCandidates(pluginFile)
+  return c.filter((x) => x === pluginFile).length === 1
+})())
+await ok('symlink 部署（WSL2 实测 bug 场景）: realpath 候选解析成功', (() => {
+  const tmp = fsSync.mkdtempSync(path.join(osMod.tmpdir(), 'kix-focus-res-'))
+  const pkgRoot = path.join(tmp, 'dsh-install')
+  const nm = path.join(pkgRoot, 'node_modules', '@deepseek-ai', 'dsh-tool-subagent')
+  fsSync.mkdirSync(nm, { recursive: true })
+  fsSync.writeFileSync(path.join(nm, 'package.json'), JSON.stringify({ name: '@deepseek-ai/dsh-tool-subagent', version: '0.0.0-test', main: 'index.js' }))
+  fsSync.writeFileSync(path.join(nm, 'index.js'), 'module.exports = { __resolverTest: true }')
+  const linkDir = path.join(tmp, 'bin-link')
+  try {
+    fsSync.symlinkSync(pkgRoot, linkDir, process.platform === 'win32' ? 'junction' : 'dir')
+  } catch {
+    // 极少数受限制环境无法创建任何链接 → 本断言退化为记录性跳过（不判失败，
+    // 但也不计通过语义的损失：链式回退行为已由下一断言覆盖）
+    return I.resolveEntryCandidates('/x').length >= 2
+  }
+  // 复现：argv[1] = 链接路径下的入口（Node 解析不跟随链接）
+  const linkEntry = path.join(linkDir, 'dsh')
+  const realEntry = path.join(pkgRoot, 'dsh')
+  fsSync.writeFileSync(realEntry, '// entry')
+  const c = I.resolveEntryCandidates(linkEntry)
+  const viaRealpath = c.includes(realEntry)
+  const savedArgv1 = process.argv[1]
+  process.argv[1] = linkEntry
+  let resolved = null
+  try {
+    const mod = I.defaultResolvePkg('@deepseek-ai/dsh-tool-subagent')
+    resolved = mod && mod.__resolverTest === true
+  } catch {
+    resolved = false
+  } finally {
+    process.argv[1] = savedArgv1
+  }
+  fsSync.rmSync(tmp, { recursive: true, force: true })
+  return viaRealpath && resolved === true
+})())
+await ok('全候选落空 → 抛最后错误（不静默 undefined）', (() => {
+  const savedArgv1 = process.argv[1]
+  process.argv[1] = '/nonexistent-root/entry.js'
+  let threw = false
+  try { I.defaultResolvePkg('@deepseek-ai/definitely-not-installed-xyz') } catch { threw = true }
+  process.argv[1] = savedArgv1
+  return threw
+})())
+
+// ── 11. lite 档平台条件化 shell（2026-08-17 部署 E2E 复验实锤修复）───────
+// v1.2.12 只修了 agent.cordis.yml 的 tool-subagent-lite 行；ACTIVATABLE_TOOLS
+// 快照漏改（硬编码 pwsh）→ capability_call 首次使用自动激活路径在 Linux 部署
+// tools.restrict() 报 unknown global tool "pwsh"。此处断言与 preset 行同源。
+section('lite 档平台条件化 shell（ACTIVATABLE_TOOLS 快照）')
+await ok('subagent_lite toolFilter 平台条件化（win32=pwsh / 其余=bash）', (() => {
+  const allow = I.ACTIVATABLE_TOOLS.subagent_lite.config.toolFilter.allow
+  const shell = process.platform === 'win32' ? 'pwsh' : 'bash'
+  return Array.isArray(allow) && allow.length === 4
+    && allow.includes(shell)
+    && !allow.includes(process.platform === 'win32' ? 'bash' : 'pwsh')
+})())
+await ok('编曲成员清单含 qa/dev/reviewer（交接门禁机械注入目标）', (() => {
+  return I.ORCH_MEMBER_TOOLS.has('subagent_qa')
+    && I.ORCH_MEMBER_TOOLS.has('subagent_dev')
+    && I.ORCH_MEMBER_TOOLS.has('subagent_reviewer')
+    && !I.ORCH_MEMBER_TOOLS.has('subagent_lite')
+    && !I.ORCH_MEMBER_TOOLS.has('subagent')
+})())
+
+// ── 12. 交接 gate 机械注入（2026-08-17，v1.2.13）─────────────────────────
+// 背景：kix-orchestration 交接门禁只对 prompt 显式 current_sprint: N 契约行
+// 生效；persona 规则靠模型自觉（上轮只加了提示）。机制兜底 = 编曲成员经
+// capability_call 分派时，工作区存在 docs/.kixpower-current-sprint 即自动注入
+// 契约行（复用 activationKeyFor 同款映射思路，见 kix-focus.js 注释）。
+section('交接 gate 机械注入（current_sprint 契约行）')
+const fsKix = require('node:fs')
+const osKix = require('node:os')
+const sprintWorkspaces = []
+function makeSprintWorkspace(markerValue) {
+  const root = fsKix.mkdtempSync(path.join(osKix.tmpdir(), 'kix-focus-sprint-'))
+  sprintWorkspaces.push(root)
+  if (markerValue !== undefined && markerValue !== null) {
+    fsKix.mkdirSync(path.join(root, 'docs'), { recursive: true })
+    fsKix.writeFileSync(path.join(root, 'docs', '.kixpower-current-sprint'), String(markerValue), 'utf8')
+  }
+  return root
+}
+function agentWithCwd(cwd) {
+  return { id: 'agent-sprint-test', session: { header: { cwd } } }
+}
+await ok('injectSprintContractLine：无契约行 → 追加（changed=true, replaced=false）', (() => {
+  const r = I.injectSprintContractLine('[CONTEXT]\n项目 @ repo\n[TASK]\n实现子任务', 3)
+  return r.changed === true && r.replaced === false
+    && /current_sprint: 3/.test(r.prompt)
+    && r.prompt.endsWith('current_sprint: 3\n')
+})())
+await ok('injectSprintContractLine：已有契约行且值不同 → 替换（replaced=true）', (() => {
+  const r = I.injectSprintContractLine('[CONTEXT]\ncurrent_sprint: 1\n[TASK]', 3)
+  return r.changed === true && r.replaced === true
+    && /current_sprint: 3/.test(r.prompt) && !/current_sprint: 1/.test(r.prompt)
+})())
+await ok('injectSprintContractLine：值一致 → 零改写（changed=false）', (() => {
+  const p = '[CONTEXT]\ncurrent_sprint: 2\n[TASK]'
+  const r = I.injectSprintContractLine(p, 2)
+  return r.changed === false && r.prompt === p
+})())
+await ok('injectSprintContractLine：替换保留行尾注释', (() => {
+  const r = I.injectSprintContractLine('current_sprint: 1 # sprint 标记', 4)
+  return /current_sprint: 4 # sprint 标记/.test(r.prompt)
+})())
+await ok('injectSprintContractLine：行锚定不误替换正文 "Sprint N" 叙述', (() => {
+  // 正文里的 "Sprint 2" 自然语言不是契约行 → 无契约行时追加，不原地改写正文
+  const r = I.injectSprintContractLine('[CONTEXT]\nSprint 2 已在进行\n[TASK]', 5)
+  return /Sprint 2 已在进行/.test(r.prompt) && /current_sprint: 5/.test(r.prompt)
+})())
+await ok('readActiveSprint：marker 纯数字 → N', (() => {
+  const root = makeSprintWorkspace(7)
+  return I.readActiveSprint(root) === 7
+})())
+await ok('readActiveSprint：marker 缺失 → 0', (() => {
+  const root = makeSprintWorkspace(null)
+  return I.readActiveSprint(root) === 0
+})())
+await ok('readActiveSprint：marker 非纯数字 → 0（fail-safe 不注入）', (() => {
+  const root = makeSprintWorkspace('v3-beta')
+  return I.readActiveSprint(root) === 0
+})())
+await ok('readActiveSprint：marker 为目录 → 0（沿用 fail-open 修复语义）', (() => {
+  const root = makeSprintWorkspace(null)
+  fsKix.mkdirSync(path.join(root, 'docs', '.kixpower-current-sprint'), { recursive: true })
+  return I.readActiveSprint(root) === 0
+})())
+await ok('readActiveSprint：workspaceRoot 空 → 0', I.readActiveSprint('') === 0)
+await ok('workspaceRootOf：agent.session.header.cwd 解析', (() => {
+  return I.workspaceRootOf({ agent: { session: { header: { cwd: '/ws' } } } }) === '/ws'
+    && I.workspaceRootOf({ agent: { id: 'x' } }) === undefined
+    && I.workspaceRootOf(undefined) === undefined
+})())
+await ok('capability_call 分派 subagent_qa + 工作区 marker → 自动注入契约行', (async () => {
+  const root = makeSprintWorkspace(2)
+  executeCalls = []
+  const r = await callTool.execute(
+    { tool: 'subagent_qa', arguments: { prompt: '[CONTEXT]\n项目 @ repo\n[TASK]\n验收' } },
+    { agent: agentWithCwd(root) })
+  return r.ok === true && r.sprintInjected === 2
+    && executeCalls.length === 1
+    && /current_sprint: 2/.test(executeCalls[0].arguments.prompt)
+    && executeCalls[0].arguments.prompt.includes('项目 @ repo')
+})())
+await ok('capability_call 分派 subagent_dev + 契约行值不符 → 修正为 marker 值', (async () => {
+  const root = makeSprintWorkspace(3)
+  executeCalls = []
+  const r = await callTool.execute(
+    { tool: 'subagent_dev', arguments: { prompt: '[CONTEXT]\ncurrent_sprint: 1\n[TASK]\n实现' } },
+    { agent: agentWithCwd(root) })
+  return r.ok === true && r.sprintInjected === 3
+    && executeCalls.length === 1
+    && /current_sprint: 3/.test(executeCalls[0].arguments.prompt)
+    && !/current_sprint: 1/.test(executeCalls[0].arguments.prompt)
+})())
+await ok('capability_call 分派 subagent_reviewer + 值已一致 → 零改写不注入', (async () => {
+  const root = makeSprintWorkspace(4)
+  executeCalls = []
+  const p = '[CONTEXT]\ncurrent_sprint: 4\n[TASK]\n反方辩护'
+  const r = await callTool.execute(
+    { tool: 'subagent_reviewer', arguments: { prompt: p } },
+    { agent: agentWithCwd(root) })
+  return r.ok === true && r.sprintInjected === undefined
+    && executeCalls.length === 1 && executeCalls[0].arguments.prompt === p
+})())
+await ok('capability_call 分派 subagent_qa + 无 marker 工作区 → 不注入', (async () => {
+  const root = makeSprintWorkspace(null)
+  executeCalls = []
+  const p = '[CONTEXT]\n项目 @ repo\n[TASK]\n验收'
+  const r = await callTool.execute(
+    { tool: 'subagent_qa', arguments: { prompt: p } },
+    { agent: agentWithCwd(root) })
+  return r.ok === true && r.sprintInjected === undefined
+    && executeCalls.length === 1 && executeCalls[0].arguments.prompt === p
+})())
+await ok('capability_call 分派非编曲成员（subagent_lite）→ 不注入', (async () => {
+  const root = makeSprintWorkspace(5)
+  executeCalls = []
+  const p = '机械核对'
+  const r = await callTool.execute(
+    { tool: 'subagent_lite', arguments: { prompt: p } },
+    { agent: agentWithCwd(root) })
+  return r.ok === true && r.sprintInjected === undefined
+    && executeCalls.length === 1 && executeCalls[0].arguments.prompt === p
+})())
+await ok('capability_call 分派 subagent_qa + 无 prompt 参数 → 不注入', (async () => {
+  const root = makeSprintWorkspace(5)
+  executeCalls = []
+  const r = await callTool.execute(
+    { tool: 'subagent_qa', arguments: {} },
+    { agent: agentWithCwd(root) })
+  return r.ok === true && r.sprintInjected === undefined
+    && executeCalls.length === 1
+})())
+
+// ── 档位守卫：subagent_lite 仅在 maxTokens > 8192 时可用 ────────────────
+section('档位守卫：subagent_lite 仅在 maxTokens > 8192 时可用')
+await ok('64K 档（65536）代理 subagent_lite → 放行', (async () => {
+  executeCalls = []
+  const r = await callTool.execute(
+    { tool: 'subagent_lite', arguments: { prompt: 'test' } },
+    { agent: { id: 'agent-64k', options: { maxTokens: 65536 } } })
+  return r.ok === true && executeCalls.length === 1 && executeCalls[0].name === 'subagent_lite'
+})())
+await ok('lite 档（8192）代理 subagent_lite → 拒（档位判断路径）', (async () => {
+  executeCalls = []
+  const r = await callTool.execute(
+    { tool: 'subagent_lite', arguments: { prompt: 'test' } },
+    { agent: { id: 'agent-lite', options: { maxTokens: 8192 } } })
+  return r.ok === false && r.error && r.error.includes('maxTokens > 8192') && executeCalls.length === 0
+})())
+
+// ── 渐进披露：browser 本地插件激活条目（2026-08-18）───────────────────
+section('渐进披露：browser 本地插件激活条目')
+await ok('ACTIVATABLE_TOOLS.browser 存在且 pkgPath 指向可装载的本地插件', (async () => {
+  const entry = I.ACTIVATABLE_TOOLS.browser
+  if (!entry || entry.pkgPath !== 'kix-browser.js') return false
+  const local = require(path.resolve(__dirname, 'kix-browser.js'))
+  return typeof local.apply === 'function' && typeof local._test?.urlRejection === 'function'
+})())
+await ok('CAPABILITY_GROUPS 含 browser-native 发现组（未挂载也可见 hint）', (async () => {
+  const g = I.CAPABILITY_GROUPS.find((x) => x.id === 'browser-native')
+  return !!g && g.tools.includes('browser') && g.hint.includes('首次使用自动激活')
+})())
+await ok('CAPABILITY_GROUPS 含 kix-surface 完整能力面（常驻货架+slash hint）', (() => {
+  const g = I.CAPABILITY_GROUPS.find((x) => x.id === 'kix-surface')
+  return !!g && g.tools.includes('skill') && g.tools.includes('experience')
+    && g.hint.includes('reviewer/dev/qa 常驻直呼')
+    && g.hint.includes('generic subagent 仅无归属 Explore')
+    && g.hint.includes('cross 常驻且只补厂商独立维度')
+    && g.hint.includes('/kixpower') && !g.hint.includes('先 kix_tool_activate')
+})())
+await ok('空查询 kix-surface 列出 skill/experience 且不经 capability_call', (() => {
+  const r = I.searchCapabilities(sampleSchemas, '')
+  const g = r.find((x) => x.id === 'kix-surface')
+  return !!g && g.exampleTools.includes('skill') && g.exampleTools.includes('experience')
+})())
+await ok('query=skill 命中 kix-surface', (() => {
+  const r = I.searchCapabilities(sampleSchemas, 'skill')
+  return r.some((g) => g.id === 'kix-surface')
+})())
+await ok('激活 browser → pkgPath 本地 require 走 ctx.plugin 挂载', (async () => {
+  pluginCalls.length = 0
+  const r = await activateTool.execute({ tool: 'browser' })
+  const calledWithModule = pluginCalls.length === 1 && typeof pluginCalls[0].pkg === 'object'
+    && typeof pluginCalls[0].pkg.apply === 'function'
+  // 复位（卸载）避免污染后续断言的 activated 集合
+  if (r.ok) await deactivateTool.execute({ tool: 'browser' })
+  return r.ok === true && calledWithModule
+})())
+
+// ── 10. restrict 失败重试（cordis effect/timer 语义镜像，2026-09-08）──────
+// 出生证明（独立 QA 取证 P1/P1c，2026-09-08，源码与安装副本同哈希）：restrict
+// 抛错时旧实现三处连环失效——
+//   1) `ctx.setInterval` 未 inject timer → `cannot get property "timer" without
+//      inject` 从 applyRestrict 的 catch 穿出 apply → 整个 kix-focus 加载失败
+//      （capability 工具与 restrict 全部消失）；
+//   2) cordis timer 的返回值是 disposer 函数（无 `.clear`），旧代码调 `.clear()`；
+//   3) 花括号 effect 体注册即执行（cordis 语义）→ 刚建的重试定时器被立刻清掉。
+// 本 section 用镜像 cordis 语义的独立 ctx（effect 回调注册即执行、返回值即卸载
+// 钩子；setInterval 句柄经 clearInterval 清理）+ 可控假定时器，锁死「失败保活 /
+// 暂态重试 / 成功停表 / 卸载清理幂等」全路径。
+section('restrict 失败重试（effect 立即执行 + disposer 语义）')
+
+// 假定时器：仅本 section 内替换全局 setInterval/clearInterval。源码自持句柄
+// （与 kix-probe.js 的 setTimeout/clearTimeout 同型），不给 inject 加 'timer'
+// ——timer 不可达时整插件停在 PENDING，比潜伏重试缺陷更硬。
+function installFakeTimers() {
+  const timers = []
+  const realSet = globalThis.setInterval
+  const realClear = globalThis.clearInterval
+  globalThis.setInterval = (cb, ms) => { const h = { cb, ms, cleared: false }; timers.push(h); return h }
+  globalThis.clearInterval = (h) => { if (h) h.cleared = true }
+  return {
+    timers,
+    live: () => timers.filter((t) => !t.cleared),
+    tick: () => { for (const t of timers) if (!t.cleared) t.cb() },
+    restore: () => { globalThis.setInterval = realSet; globalThis.clearInterval = realClear },
+  }
+}
+
+// 独立 apply 实例：restrict 行为由 mode 控制（fail → ok）。
+function makeRetryInstance() {
+  const effectDisposers = []
+  const logs = []
+  const registered = []
+  let mode = 'fail'
+  let restrictCalls = 0
+  const ctx2 = {
+    tools: {
+      schemas: (scope) => (scope === undefined ? [{ name: 'mcp__probe__alpha', description: 'x' }] : []),
+      register(def) { registered.push(def); return () => {} },
+      restrict() { restrictCalls += 1; if (mode === 'fail') throw new Error('probe: restrict refused'); return () => {} },
+      get: () => undefined,
+      guard: () => () => {},
+      execute: async () => ({ isError: false }),
+    },
+    get: () => undefined,
+    logger: { info: (m) => logs.push('I:' + m), warn: (m) => logs.push('W:' + m), error: (m) => logs.push('E:' + m) },
+    on() {},
+    effect(cb) { effectDisposers.push(cb()); return () => {} }, // 镜像 cordis：注册即执行，返回值即卸载钩子
+    plugin() { return { dispose: async () => {}, state: 2 } },
+  }
+  return { ctx: ctx2, effectDisposers, logs, registered, setMode: (m) => { mode = m }, restrictCalls: () => restrictCalls }
+}
+
+// A. 失败保活 + 注册重试 + 卸载清理幂等
+{
+  const ft = installFakeTimers()
+  try {
+    const inst = makeRetryInstance()
+    let applyThrew = null
+    try { plugin.apply(inst.ctx, { resolvePkg: (p) => p }) } catch (e) { applyThrew = e }
+    await ok('restrict 抛错时 apply 不抛错（旧实现整插件丢失）', applyThrew === null)
+    await ok('restrict 抛错后 search/call/activate/deactivate 四工具仍注册', ['kix_capability_search', 'kix_capability_call', 'kix_tool_activate', 'kix_tool_deactivate'].every((n) => inst.registered.some((t) => t.name === n)))
+    await ok('restrict 失败只 warn 一次', inst.logs.filter((l) => l.startsWith('W:') && l.includes('restrict 失败')).length === 1)
+    await ok('失败后注册 3s 重试定时器', ft.live().length === 1 && ft.live()[0].ms === 3000)
+    await ok('每个 effect 都注册了函数型卸载钩子（含重试清理，旧实现 .clear 型无 disposer）', inst.effectDisposers.length === 5 && inst.effectDisposers.every((d) => typeof d === 'function'))
+    // 卸载：effect disposer 清掉在飞的重试定时器；重复调用幂等
+    inst.effectDisposers.forEach((d) => d())
+    await ok('卸载清理清除在飞重试定时器', ft.live().length === 0)
+    const beforeUnload = inst.restrictCalls()
+    ft.tick()
+    await ok('卸载后 tick 不再调用 restrict', inst.restrictCalls() === beforeUnload)
+    await ok('卸载清理重复调用不抛错（幂等）', (() => {
+      try { inst.effectDisposers.forEach((d) => d()); inst.effectDisposers.forEach((d) => d()); return true } catch { return false }
+    })())
+  } finally { ft.restore() }
+}
+
+// B. 暂态失败 → 重试成功 → 停表
+{
+  const ft = installFakeTimers()
+  try {
+    const inst = makeRetryInstance()
+    plugin.apply(inst.ctx, { resolvePkg: (p) => p })
+    inst.setMode('ok')
+    const before = inst.restrictCalls()
+    ft.tick()
+    await ok('重试 tick 再次调用 restrict 并成功', inst.restrictCalls() === before + 1)
+    await ok('restrict 成功后重试定时器被清除', ft.live().length === 0)
+    const afterSuccess = inst.restrictCalls()
+    ft.tick()
+    await ok('成功后 tick 不再调用 restrict（clearInterval 生效）', inst.restrictCalls() === afterSuccess)
+  } finally { ft.restore() }
+}
+
+// C. 一次成功：不注册重试定时器
+{
+  const ft = installFakeTimers()
+  try {
+    const inst = makeRetryInstance()
+    inst.setMode('ok')
+    plugin.apply(inst.ctx, { resolvePkg: (p) => p })
+    await ok('restrict 一次成功时不注册重试定时器', ft.live().length === 0)
+    await ok('一次成功无 restrict 失败 warn', inst.logs.every((l) => !l.includes('restrict 失败')))
+    await ok('成功路径 effect 数 = 5（restrict dispose + 4 工具 dispose）', inst.effectDisposers.length === 5)
+  } finally { ft.restore() }
+}
+
+// ── 清理临时工作区（2026-08-17：与 kix-orchestration.test 同款纪律）──────
+for (const ws of sprintWorkspaces) fsKix.rmSync(ws, { recursive: true, force: true })
+
+// ── 汇总 ──
+console.log('\n──────────────────────────────')
+console.log(`kix-focus: ${passed} passed, ${failed} failed`)
+if (failed > 0) process.exit(1)
+})().catch((e) => { console.error('kix-focus.test 异常:', e); process.exit(1) })

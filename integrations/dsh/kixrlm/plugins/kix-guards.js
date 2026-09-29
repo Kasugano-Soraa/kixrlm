@@ -1,0 +1,1481 @@
+// kix-guards — kixparadigm 机械门禁的 DSH 原生实现（v18，v1.3.10）
+//
+// v18（2026-08-29，用户裁决）：删除 run_code 门禁 1b 的代码体静态能力扫描。
+// DSH worker 的权威信任姿态本就是 bash-equivalent containment（每次新 worker、
+// env={}、CPU/墙钟/堆/输出上限、强制终止），而 1b 仅靠字符级 API 塑形：
+// 一边误拦安全内置模块、只读 fs.open(..., 'r') 与普通 constructor 内省，
+// 一边可被 computed property / globalThis / dynamic codegen 绕过；保护不可强制，
+// 限制却真实存在。run_code 现在完整保留 JS/TS/Node 原生能力；其 tools.* 子调用
+// 仍逐次经过完整 pre-execute 门禁，未知工具、终端 Git/SQL、控制平面与 GitHub
+// 门禁均不变。残余风险如实保留：原生 fs/network/child_process 不再逐动作审计，
+// 且 worker.terminate() 不保证回收程序派生的 OS 进程。
+//
+// v19（2026-09-11）：kix_capability_call 解开内层 GitHub MCP 写。
+// DSH 0.1.2-rc.1 restrict 是执行 ACL，capability_call 对被 deny 的 MCP 必须
+// 省略 agent 走全局 execute，内层 pre-execute 看不到 kix-guards。GitHub 写
+// main/缺 branch 改在外层 capability_call 上 unwrap args.tool，沿用既有
+// checkGitHubWrite。直呼 mcp__github__* 路径保留（restrict 若关闭仍拦）。
+//
+// v15（2026-08-20，哲学自检 F1 裁决）：commit 预算线从硬 DENY 降为**结算 steer**
+// （放行 + post 成功注入一次对账提醒，v12 控制平面同款 pending 机制），硬帽 fuse
+// （COMMIT_HARD_CAP，不可配）保留硬 DENY。同时删除 v14 的
+// detectFailureDrivenBonus（commit message regex 分类推断「失败驱动」意图）。
+// 出生/死亡证明：
+//   - v14 无出生证明：仓库与 CHANGELOG 均无「预算线拦断合法修复链」的事故记录，
+//     属为想象中的问题放松真实存在的守卫；
+//   - message 文本启发式意图分类与 v1.2.15 判死删除的 shell 命令文本机械提取
+//     同类负债：覆盖差 / 误报真实（`chore:`/`test:` 常规提交被计为失败驱动，
+//     正常节奏即把冷启动预算抬满 +3）/ `.ci-failed` 等标记文件无任何创建者
+//     =死代码路径 / 零单测覆盖；
+//   - 病根是定价错误：预算线 DENY 拦下可逆的本地 commit 只为强迫记账（DENY
+//     消息自述「请同步预算到 sprint 文档」），把会计问题定价成失控问题，v14
+//     的意图推断是误定价逼出的代偿——只删代偿不动定价，同压力会再生 v15'。
+//     修正定价：超额不禁止但必须在结算时显式交代（同步预算，或在交付说明
+//     中声明失败驱动链）——失败修复链合法通过，静默漂移变贵（让隐藏变贵、
+//     让测量变免费）；失控 thrash 不响应 steer，由 fuse 熔断（41-step gate /
+//     token 预算 hard gate 同族先例）。commit 计数与预算比对是确定性谓词，
+//     steer 触发条件 0% 误报；
+//   - 测度点：每次 steer 触发记 near-miss 结构化日志（commits/budget/source），
+//     攒真实 sprint 数据后校准 COMMIT_BUDGET_DEFAULT 与 fuse 阈值（6 未见
+//     实测数据，v15 回退保守值 3——steer 化后错误默认的代价只是一次提醒，
+//     不再是拦断）；
+//   - 退役条件：若实测出现「模型对 steer 无响应、fuse 触发前已造成不可逆
+//     破坏」的事故，预算线可回硬 DENY 并在此记录第二轮出生证明。
+//
+// 移植自 kixpower 的 blast-radius-check.ps1 / block-source-edit.ps1 核心门禁，
+// 以 DSH `tools/pre-execute` 监听器形态自动拦截（等价 Copilot PreToolUse hook）。
+//
+// v2（2026-08-15）：补全 blast-radius 未接线门禁 —— commit budget、真实分支检查、
+// force push 完整检测、MCP GitHub 远程写保护、终端数据库客户端保守拦截、
+// UPDATE without WHERE、人类确认点 ask。
+// v3（2026-08-15，独立审查 2fed9f16 驱动）：
+//   - 修复漏拦：git 子命令改「解析式」检测（gitSubcommands），`git -C x push --force`、
+//     `git -c k=v push`、`git.exe push`、`git -C x reset --hard` 不再绕过整个 git 门禁；
+//     push 目标参数检测补 refs/heads/main 形态
+//   - 修复误伤：isDestructiveSql 限定 SQL 上下文（DB 客户端 / SQL 工具），grep/echo 裸
+//     文本不再误拦；改语句级判定 + 剥字符串/注释（`DELETE FROM a; SELECT ... WHERE`、
+//     `UPDATE public.users SET`、`/* WHERE 1 */` 不再漏拦）；force/main 检测限定真实
+//     push/commit 子命令（commit message 含 "push +5"/"main.rs" 不再误拦）；`--force`/
+//     `--mirror` 补 `(?<![\w-])` 前缀断言（`abc--force` 不再误拦）；移除 rebase 兜底硬
+//     deny（`git rebase -i`/`git pull --rebase` 放行，与 ps1 一致）；targetsControlPlane
+//     限定用户级根（home/.dsh、.agent-presets、安装副本 agent.cordis.yml），项目级
+//     settings.yaml 不再误拦；v11 再豁免源仓库 dsh/preset|en/preset 事实源
+//   - SQL 工具（sql/sql_execute/run_sql）加入 KNOWN_SAFE_TOOLS（消除门禁 1 死代码，
+//     门禁 4 可达）；run_code 1b 补 require('fs')/import('fs')/writeFileSync 检查
+//   - 保留（按 kix 0% 误报纪律 + 规则是负债）：角色边界门禁不接（exec.agent 无角色
+//     标记）、预算一致性软警告不接（建议类不进机械层）、SQL 文件引用检查不接
+//     （psql -f 场景，文本纪律覆盖，见 capability map §3）
+// v5（2026-08-15，用户决策）：ask 级门禁从 approval 服务弹窗改为**聊天内提问**
+//   （ctx.userQuestions.ask —— 即 ask_user_question 的底层服务）。审批策略
+//   danger-full-access 已恢复 approval: never（全自动、零审批弹窗）；需人类确认
+//   的门禁（普通 git push / 本地破坏性 Git 操作 / GitHub 写）在聊天里问
+//   「允许执行/拒绝」，用户回答决定放行。硬 deny（force push / main 分支 /
+//   控制平面 / 破坏性 SQL / 未知执行工具 / commit budget）不变。
+//   降级（fail-safe）：无 userQuestions 服务 / exec 无 agent / 提问被中止或
+//   抛错（子代理 DELEGATED_CALLER、无 provider 等）→ 自动拒绝（deny）。
+// v6（2026-08-16，用户实测反馈驱动）：
+//   - 堵「gh CLI 绕门禁」：模型常经 pwsh 调 gh（GitHub CLI）绕过 MCP GitHub
+//     ask 门禁（实测反馈：批量开 PR）。新增终端 2d 门禁：gh 写操作（pr
+//     create/merge/close/reopen/ready/review、issue create/close/edit、
+//     repo create/fork/transfer、release create/delete、branch -d/-D、
+//     secret/variable set、workflow run、api -X POST/PATCH/PUT/DELETE 等）
+//     → 聊天内 ask（与 MCP GitHub mutation 同档）；破坏性（gh repo delete /
+//     gh api -X DELETE / gh release delete）→ deny。只读 gh（view/list/auth/
+//     api GET）放行。0 误报：gh 是 GitHub 专用 CLI，子命令枚举精确。
+//   - 堵「反复重复」：会话内同一操作（终端命令规范化文本 / edit 路径 /
+//     GitHub 工具名+参数）已被 deny 或用户拒绝后再次出现 → 直接 deny 附
+//     原拒绝原因 +「禁止重复尝试」，不再反复提问。memo 存插件闭包（每
+//     agent scope 一份 = 每会话独立），只记录拒绝（用户放行的不记录）。
+// v7（2026-08-16，dae 仓库实测误报驱动；0% 误报纪律）：
+// v9（v1.2.11 用户决策：发布/评论等确认类门禁降为软约束）：
+//   - 用户明确指示（如「评论到PR」）= 已决策；机械层不再逐操作提问。
+//   - 原 ASK 级门禁（普通 push / 本地破坏性 git / gh 与 GitHub mutation）
+//     全部改为放行，由 persona + kixpower-review 流程做软约束。
+//   - 硬 DENY 仅保留真正不可逆/可机械判定为破坏性的操作：force push、
+//     main/master 保护、破坏性 SQL、未知执行工具、run_code
+//     受限能力、gh/GitHub 删除远端数据。
+//
+// v8（v1.2.10 自审整改；0% 误报反例回归）：
+//   - 终端破坏性 SQL 改为「DB 客户端命令位 + SQL payload 语句级判定」：
+//     echo/grep/字符串字面量不再误拦；显式 SQL 交给 isDestructiveSql 剥字符串/
+//     注释；管道喂 SQL（echo DROP | psql）仍拦；DELETE/UPDATE 带 WHERE 放行。
+//   - 控制平面保护改为只拦明确写意图（写/删/改动词或 shell 重定向命中目标）；
+//     grep/cat/ls/Get-Content 等只读诊断放行。
+//   - GitHub MCP 工具前缀可经 config.githubToolPrefix 配置（默认 mcp__github__）。
+//
+// v11（v1.2.14，PR#10 遗留）：targetsControlPlane 见任意 agent.cordis.yml 就
+//   deny，把源仓库事实源（dsh/preset/、en/preset/）当成安装副本误伤——维护者
+//   无法在本仓库改挂载注释/计数。安装面（~/.dsh / .agent-presets）仍优先命中。
+//
+// v13（v1.2.22，跨厂商反方审查）：run_code 数据面剥离；regex/division/tagged-template
+// 歧义 fail-closed，U+2028/U+2029 终止行注释，codegen/optional-chain 能力补拦。
+// v12（v1.2.14，用户决策）：控制平面写从硬 deny 降为 remind。kix 自迭代 /
+//   用户已授权改安装副本时，硬拦会挡正事；安装面仍识别并注入一次提醒
+//   （additionalContexts，带 id），不记 denyMemo。源仓库事实源继续豁免
+//   （不提醒）。force push / main / 破坏性 SQL 仍硬 deny。
+//
+//   - 修复「reflog 计数惩罚历史修整」：改用 reflog subject（%gs）口径，
+//     只数 commit 类条目。reset / merge / pull / checkout / rebase 不再
+//     计入（它们不创建 commit 对象；reset+recommit / rebase 是推荐的历史
+//     修整工作流）。amend 计入 hard cap 口径（重写 commit 对象的 churn）
+//     但不计入 budget 口径（不改逻辑 commit 数）。实测：3 逻辑 commit +
+//     2 次 reset 重做 + 1 次 amend 曾被 %H 口径计为 8 次，误触熔断。
+//   - 修复「过期 sprint 指针」：marker 指向的 sprint 已有 done.md → warn
+//     并回退最大编号 sprint 目录；最大编号也已完结 → staleAll warn 并在
+//     deny 消息标注「预算基线过期」。实测：docs/.kixpower-current-sprint
+//     停在 6 而 sprint-9 已完结，门禁拿 12 天前 sprint-6 的 budget=3
+//     约束 sprint-9 之后的 hotfix 工作。
+//   - 修复「预算兜底缺口 + 静默冷启动」：plan.md 增读 blast_radius.max_commits
+//     （ps1 同源字段）；优先级 progress.commit_budget > plan.task_sizing.
+//     derived_commit_budget > plan.blast_radius.max_commits > 冷启动 3，
+//     落冷启动必须 warn；deny 消息注明预算来源与 sprint 目录，移除误导性
+//     的「按 DAG 重算」措辞（任务 DAG 是规划文档，不做拦截）。
+//
+// 挂载方式：preset agent.cordis.yml 中一行：
+//   - id: kix-guards
+//     name: ./plugins/kix-guards.js
+// 说明：本监听器按 agent scope 挂载，只拦本 preset 的会话；deny 返回 reason 由
+// 工具执行管道呈现；ask 级门禁直接调 ctx.userQuestions.ask() 在聊天里提问
+// （无 agent/无 userQuestions 自动降级 deny，fail-safe）。
+//
+// 纯逻辑导出：module.exports.__internals 供单元测试直接验证判定函数
+// （不影响 DSH loader：loader 只读 name/inject/apply）。
+
+'use strict'
+
+const { readFile } = require('node:fs/promises')
+const { join } = require('node:path')
+const { homedir } = require('node:os')
+const { randomUUID } = require('node:crypto')
+const { execFile } = require('node:child_process')
+const { promisify } = require('node:util')
+
+const execFileP = promisify(execFile)
+
+// ── 常量（blast-radius ps1 同源）───────────────────────────────────────────
+const COMMIT_HARD_CAP = 10          // 9 Ways 防线：绝对硬上限，不可配（失控熔断，v15 起预算线 steer 化后是唯一硬拦截）
+const COMMIT_BUDGET_DEFAULT = 3     // 冷启动兜底（δ 未知时的保守值；v15 回退 v14 的无证据提升 6——见头部 v15 死亡证明）
+
+// ── v3 纯判定函数（模块级：单元测试经 __internals 直接验证）───────────────
+
+// 剥 SQL 字符串/注释噪音（ps1 332-335 同序列）
+function stripSqlNoise(text) {
+  let t = String(text || '')
+  t = t.replace(/'(?:''|[^'])*'/g, ' ')
+  t = t.replace(/"(?:""|[^"])*"/g, ' ')
+  t = t.replace(/\/\*[\s\S]*?\*\//g, ' ')
+  t = t.replace(/(?:--|#)[^\r\n]*/g, ' ')
+  return t
+}
+
+// v3：语句级判定（ps1 340-347/362-368 语义）：
+//   - 按 ; 分语句；DROP/TRUNCATE/ALTER 任意出现 → 破坏性
+//   - DELETE FROM / UPDATE SET 且该语句无 WHERE → 破坏性
+//   只在 SQL 上下文（DB 客户端 / SQL 工具）调用，不作用于裸终端文本。
+function isDestructiveSql(text) {
+  const t = stripSqlNoise(text)
+  for (const stmt of t.split(';')) {
+    if (/\b(?:drop|truncate|alter)\b/i.test(stmt)) return true
+    if ((/\bdelete\b[^;]*?\bfrom\b/i.test(stmt) || /\bupdate\b[^;]*?\bset\b/i.test(stmt)) && !/\bwhere\b/i.test(stmt)) return true
+  }
+  return false
+}
+
+// 终端数据库客户端（命令位判定 + SQL payload 语句级判定，v8）。
+// v8 修复（0% 误报回归）：旧实现只要命令文本同时出现 DB 客户端名与破坏性
+// 关键字就拦，导致 echo/grep/字符串字面量等只读或无关命令被误判。现改为：
+//   1. 按 shell 分隔符拆段，识别「命令位」上的 DB 客户端（sudo/env 前缀兼容）；
+//   2. 优先提取 -c/--command/-e/--execute/-Q/--query 的 SQL payload，
+//      交给 isDestructiveSql 做剥字符串/注释后的语句级判定；
+//   3. 无显式 payload 时，仅当前一段通过管道喂给 DB 客户端且含破坏性
+//      关键字才拦（如 `echo DROP TABLE | psql`）。
+//   `cat migration.sql | psql`、`grep psql`、`echo "psql DROP"` 不再误拦。
+const DB_CLIENT_NAMES = new Set(['psql', 'mysql', 'mariadb', 'sqlite3', 'sqlcmd', 'clickhouse-client', 'duckdb'])
+const SQL_PAYLOAD_FLAGS = new Set(['-c', '--command', '-e', '--execute', '-Q', '--query'])
+
+/** quote-aware shell 拆段：返回 [{ text, sepBefore }]；sepBefore 为 ;/&&/||/|/newline 或 null。
+ *  heredoc 正文（<<TAG … 结束行）当数据，不拆成后续调用。 */
+function splitShellSegments(text) {
+  const parts = []
+  let cur = ''
+  let pendingSep = null
+  let quote = null
+  let escaped = false
+  const heredocs = []
+  const flush = () => {
+    const value = cur.trim()
+    if (value) parts.push({ text: value, sepBefore: pendingSep })
+    cur = ''
+    pendingSep = null
+  }
+  const s = String(text || '')
+  const consumeHeredocBody = (from, tag, stripTabs) => {
+    let i = from
+    while (i <= s.length) {
+      const lineStart = i
+      while (i < s.length && s[i] !== '\n' && s[i] !== '\r') i++
+      let line = s.slice(lineStart, i)
+      if (stripTabs) line = line.replace(/^\t+/, '')
+      if (line === tag) {
+        if (s[i] === '\r' && s[i + 1] === '\n') return i + 2
+        if (s[i] === '\n' || s[i] === '\r') return i + 1
+        return i
+      }
+      if (i >= s.length) return i
+      if (s[i] === '\r' && s[i + 1] === '\n') i += 2
+      else i += 1
+    }
+    return i
+  }
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i]
+    if (quote) {
+      cur += ch
+      if (escaped) escaped = false
+      else if (ch === '\\') escaped = true
+      else if (ch === quote) quote = null
+      continue
+    }
+    if (ch === "'" || ch === '"') { quote = ch; cur += ch; continue }
+    if (ch === '#' && (cur === '' || i === 0 || /\s/.test(s[i - 1]))) {
+      while (i < s.length && s[i] !== '\n' && s[i] !== '\r') i++
+      i--
+      continue
+    }
+    if (ch === '\\' && i + 1 < s.length) { cur += ch + s[i + 1]; i++; continue }
+    if (ch === '<' && s[i + 1] === '<' && s[i + 2] !== '<') {
+      cur += '<<'
+      i += 2
+      let stripTabs = false
+      if (s[i] === '-') { stripTabs = true; cur += '-'; i++ }
+      while (s[i] === ' ' || s[i] === '\t') { cur += s[i]; i++ }
+      let tag = ''
+      if (s[i] === "'" || s[i] === '"') {
+        const q = s[i]
+        cur += q
+        i++
+        while (i < s.length && s[i] !== q) { tag += s[i]; cur += s[i]; i++ }
+        if (s[i] === q) { cur += q; i++ }
+      } else {
+        while (i < s.length && !/\s/.test(s[i]) && s[i] !== ';' && s[i] !== '&' && s[i] !== '|') {
+          tag += s[i]
+          cur += s[i]
+          i++
+        }
+      }
+      if (tag) heredocs.push({ tag, stripTabs })
+      i--
+      continue
+    }
+    if (ch === ';' || ch === '\n' || ch === '\r') {
+      flush()
+      pendingSep = ';'
+      if ((ch === '\n' || ch === '\r') && heredocs.length) {
+        if (ch === '\r' && s[i + 1] === '\n') i++
+        let pos = i + 1
+        while (heredocs.length) {
+          const h = heredocs.shift()
+          pos = consumeHeredocBody(pos, h.tag, h.stripTabs)
+        }
+        i = pos - 1
+      }
+      continue
+    }
+    if (ch === '&' && s[i + 1] === '&') { flush(); pendingSep = '&&'; i++; continue }
+    if (ch === '|' && s[i + 1] === '|') { flush(); pendingSep = '||'; i++; continue }
+    if (ch === '|') { flush(); pendingSep = '|'; continue }
+    cur += ch
+  }
+  flush()
+  return parts
+}
+
+/** quote-aware shell 分词（去掉外层引号；保留内部转义后的内容）。 */
+function shellTokens(segment) {
+  const tokens = []
+  let cur = ''
+  let quote = null
+  let escaped = false
+  const s = String(segment || '')
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i]
+    if (quote) {
+      if (escaped) { cur += ch; escaped = false }
+      else if (ch === '\\') escaped = true
+      else if (ch === quote) quote = null
+      else cur += ch
+      continue
+    }
+    if (ch === "'" || ch === '"') { quote = ch; continue }
+    if (ch === '#' && (i === 0 || /\s/.test(s[i - 1]))) break
+    if (ch === '\\' && i + 1 < s.length) {
+      const next = s[i + 1]
+      if (/[\s'"\\|&;<>#*?(){}[\]$`!]/.test(next)) { cur += next; i++; continue }
+    }
+    if (/\s/.test(ch)) { if (cur) { tokens.push(cur); cur = '' } continue }
+    cur += ch
+  }
+  if (cur) tokens.push(cur)
+  return tokens
+}
+
+function commandBasename(token) {
+  const value = String(token || '')
+  return value.replace(/^["']|["']$/g, '').replace(/\.exe$/i, '').split(/[\\/]/).pop().toLowerCase()
+}
+
+/** 返回 { name, args }：跳过赋值前缀与 sudo/env/command 及它们的前置旗标。 */
+function leadingCommand(tokens) {
+  const list = Array.isArray(tokens) ? tokens : []
+  let i = 0
+  while (i < list.length) {
+    const t = list[i]
+    if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(t)) { i++; continue }
+    if (/^(?:sudo|doas|env|command)$/i.test(t)) { i++; continue }
+    break
+  }
+  while (i < list.length && list[i].startsWith('-')) {
+    i += (i + 1 < list.length && !list[i + 1].startsWith('-')) ? 2 : 1
+  }
+  if (i >= list.length) return undefined
+  return { name: commandBasename(list[i]), args: list.slice(i + 1) }
+}
+
+/** 提取显式 SQL payload（flag value 或 --flag=value）。 */
+function extractSqlPayload(tokens) {
+  for (let i = 0; i < tokens.length; i++) {
+    const raw = tokens[i]
+    const eq = raw.match(/^(--[a-z-]+)=(.*)$/i)
+    if (eq && SQL_PAYLOAD_FLAGS.has(eq[1].toLowerCase())) return eq[2]
+    if (SQL_PAYLOAD_FLAGS.has(raw.toLowerCase())) {
+      if (i + 1 < tokens.length && !tokens[i + 1].startsWith('-')) return tokens[i + 1]
+    }
+  }
+  return undefined
+}
+
+function isTerminalDestructiveSql(text) {
+  const parts = splitShellSegments(text)
+  for (let i = 0; i < parts.length; i++) {
+    const tokens = shellTokens(parts[i].text)
+    const cmd = leadingCommand(tokens)
+    if (!cmd || !DB_CLIENT_NAMES.has(cmd.name)) continue
+    const payload = extractSqlPayload(tokens.slice(1))
+    if (payload !== undefined) {
+      if (isDestructiveSql(payload)) return true
+      continue
+    }
+    if (parts[i].sepBefore === '|' && i > 0) {
+      const prev = leadingCommand(shellTokens(parts[i - 1].text))
+      if (prev && /^(?:echo|printf|cat|head|tail)$/.test(prev.name) && isDestructiveSql(parts[i - 1].text)) return true
+    }
+  }
+  return false
+}
+
+// Git 全局 options 中只有这些形态会消费下一 token；其余 flags 只跳过自身。
+// 已带值的 --x=y / -Cpath / -ckey=value 不再消费后续子命令。
+const GIT_GLOBAL_OPTIONS_WITH_VALUE = new Set([
+  '-C', '-c', '--config-env', '--exec-path', '--git-dir', '--work-tree',
+  '--namespace', '--super-prefix', '--attr-source',
+])
+
+// 每段独立一条 git 调用：子命令 + 该子命令自己的参数。
+// push 保护 / epoch 只读边界必须按段解析——旧实现用 push 后 [\s\S]*，
+// 会把同行 `gh pr create --base main` 吃进 push 参数。
+function gitInvocations(text) {
+  const out = []
+  for (const part of splitShellSegments(text)) {
+    const command = leadingCommand(shellTokens(part.text))
+    if (!command || command.name !== 'git') continue
+    const tokens = command.args
+    for (let i = 0; i < tokens.length; i++) {
+      const t = tokens[i]
+      if (t === '--') continue
+      if (GIT_GLOBAL_OPTIONS_WITH_VALUE.has(t)) {
+        if (i + 1 < tokens.length) i++
+        continue
+      }
+      if (/^-(?:C|c).+/.test(t) || t.startsWith('--')) continue
+      if (t.startsWith('-')) continue
+      out.push({ sub: t, args: tokens.slice(i + 1) })
+      break
+    }
+  }
+  return out
+}
+function gitSubcommands(text) {
+  return new Set(gitInvocations(text).map((inv) => inv.sub))
+}
+function hasGitSubcommand(text, sub) {
+  return gitSubcommands(text).has(sub)
+}
+
+// ── v6：gh CLI（GitHub CLI）写保护 ─────────────────────────────────────────
+// 模型常经 pwsh 调 gh 绕过 MCP GitHub 门禁（实测反馈：gh pr create 批量开 PR）。
+// gh 是 GitHub 专用 CLI：实体+动作枚举精确——只读（view/list/auth/api GET）
+// 放行，写操作 ask（与 MCP GitHub mutation 同档），破坏性 deny。
+const GH_MUTATION_ACTIONS = new Map([
+  ['pr', new Set(['create', 'merge', 'close', 'reopen', 'ready', 'review', 'edit', 'delete', 'comment'])],
+  ['issue', new Set(['create', 'close', 'reopen', 'edit', 'delete', 'comment', 'pin', 'unpin', 'lock', 'unlock', 'transfer'])],
+  ['repo', new Set(['create', 'fork', 'transfer', 'rename', 'edit', 'archive', 'unarchive', 'delete'])],
+  ['release', new Set(['create', 'edit', 'delete'])],
+  ['branch', new Set(['-d', '-D', 'delete'])],
+  ['run', new Set(['rerun', 'cancel', 'delete'])],
+  ['secret', new Set(['set', 'delete'])],
+  ['variable', new Set(['set', 'delete'])],
+  ['gist', new Set(['create', 'edit', 'delete'])],
+  ['workflow', new Set(['run', 'enable', 'disable'])],
+])
+
+// 每段独立一条 gh 调用。整段 \bgh\b[^;&|]* 会把 grep/commit 消息/title 里的
+// 「gh repo delete」当成真删除，逼模型改命令。
+function ghInvocations(text) {
+  const out = []
+  for (const part of splitShellSegments(text)) {
+    const command = leadingCommand(shellTokens(part.text))
+    if (!command || command.name !== 'gh') continue
+    out.push(command.args)
+  }
+  return out
+}
+
+function ghSkipFlag(args, i) {
+  const t = args[i]
+  if (t.startsWith('--') && t.includes('=')) return i
+  if (i + 1 < args.length && !String(args[i + 1]).startsWith('-')) return i + 1
+  return i
+}
+
+function ghEntityActionFromArgs(args) {
+  const list = Array.isArray(args) ? args : []
+  for (let i = 0; i < list.length; i++) {
+    const t = list[i]
+    if (t.startsWith('-')) {
+      i = ghSkipFlag(list, i)
+      continue
+    }
+    const entity = String(t).toLowerCase()
+    let action
+    if (i + 1 < list.length && !String(list[i + 1]).startsWith('-')) {
+      action = String(list[i + 1]).toLowerCase()
+    }
+    return { entity, action }
+  }
+  return undefined
+}
+
+function ghApiWriteMethod(args) {
+  const hit = ghEntityActionFromArgs(args)
+  if (!hit || hit.entity !== 'api') return undefined
+  const list = Array.isArray(args) ? args : []
+  for (let i = 0; i < list.length; i++) {
+    const t = String(list[i])
+    if (t === '-X' || t === '--method') {
+      if (i + 1 < list.length) return String(list[i + 1]).toUpperCase()
+      continue
+    }
+    const m = t.match(/^--method=(.+)$/i)
+    if (m) return String(m[1]).toUpperCase()
+  }
+  return undefined
+}
+
+function ghInvocationDestructive(args) {
+  const hit = ghEntityActionFromArgs(args)
+  if (hit && hit.action === 'delete' && (hit.entity === 'repo' || hit.entity === 'release')) return true
+  return ghApiWriteMethod(args) === 'DELETE'
+}
+
+// 解析 gh 的（实体, 动作）：只看本条 gh 调用参数，跳过旗标及其值。
+function ghEntityAction(text) {
+  for (const args of ghInvocations(text)) {
+    const hit = ghEntityActionFromArgs(args)
+    if (hit) return hit
+  }
+  return undefined
+}
+
+function isGhDestructive(text) {
+  for (const args of ghInvocations(text)) {
+    if (ghInvocationDestructive(args)) return true
+  }
+  return false
+}
+
+function isGhMutation(text) {
+  for (const args of ghInvocations(text)) {
+    if (ghInvocationDestructive(args)) continue
+    const method = ghApiWriteMethod(args)
+    if (method && method !== 'GET' && method !== 'HEAD') return true
+    const hit = ghEntityActionFromArgs(args)
+    if (!hit || !hit.action) continue
+    const actions = GH_MUTATION_ACTIONS.get(hit.entity)
+    if (actions !== undefined && actions.has(hit.action)) return true
+  }
+  return false
+}
+
+// ── v6：重复尝试记忆（会话内同操作已被拒 → 直接 deny，不再反复提问）──────
+function normalizeMemo(text) {
+  return String(text || '').trim().toLowerCase().replace(/\s+/g, ' ')
+}
+function stableArgs(args) {
+  if (!args || typeof args !== 'object') return ''
+  return Object.keys(args)
+    .filter((k) => args[k] !== undefined)
+    .sort()
+    .map((k) => `${k}=${typeof args[k] === 'object' ? JSON.stringify(args[k]) : String(args[k])}`)
+    .join('&')
+}
+
+function escapeRegex(text) {
+  return String(text || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
+// 通用 JavaScript 数据面扫描 helpers。run_code 1b 已退役，但 orchestration
+// review epoch 仍用 executableJsSurface 判断 node -e / python -c 是否写 artifact。
+function skipStringAt(s, i) {
+  const q = s[i]
+  let j = i + 1
+  while (j < s.length) {
+    if (s[j] === '\\') { j += 2; continue }
+    if (s[j] === q) return j + 1
+    j++
+  }
+  return s.length
+}
+function skipLineCommentAt(s, i) {
+  let j = i
+  while (j < s.length && s[j] !== '\n' && s[j] !== '\r' && s[j] !== '\u2028' && s[j] !== '\u2029') j++
+  return j
+}
+function skipBlockCommentAt(s, i) {
+  let j = i + 2
+  while (j < s.length) {
+    if (s[j] === '*' && s[j + 1] === '/') return j + 2
+    j++
+  }
+  return s.length
+}
+
+// JavaScript 参数常携带待编辑源码；字符串/注释是数据，不应按执行能力拦截。
+// Template raw text 同样剥离，但 ${...} 内表达式递归保留并继续检查。
+function blankJsDataRanges(source) {
+  const s = String(source || '')
+  const out = s.split('')
+  const isLineTerminator = (ch) => ch === '\n' || ch === '\r' || ch === '\u2028' || ch === '\u2029'
+  const blankRange = (start, end) => {
+    for (let i = start; i < end && i < out.length; i++) {
+      if (!isLineTerminator(out[i])) out[i] = ' '
+    }
+  }
+  let i = 0
+  while (i < s.length) {
+    const ch = s[i]
+    if (ch === "'" || ch === '"') {
+      const end = skipStringAt(s, i)
+      blankRange(i, end)
+      i = end
+      continue
+    }
+    if (ch === '`') {
+      let j = i + 1
+      while (j < s.length && s[j] !== '`') {
+        if (s[j] === '\\') { j += 2; continue }
+        j++
+      }
+      const end = Math.min(s.length, j + 1)
+      blankRange(i, end)
+      i = end
+      continue
+    }
+    if (ch === '/' && s[i + 1] === '/') {
+      const end = skipLineCommentAt(s, i)
+      blankRange(i, end)
+      i = end
+      continue
+    }
+    if (ch === '/' && s[i + 1] === '*') {
+      const end = skipBlockCommentAt(s, i)
+      blankRange(i, end)
+      i = end
+      continue
+    }
+    if (ch === '/') {
+      let j = i + 1
+      let closed = false
+      while (j < s.length && !isLineTerminator(s[j])) {
+        if (s[j] === '\\') { j += 2; continue }
+        if (s[j] === '/' && s[j + 1] === '/') break
+        if (s[j] === '/' && s[j + 1] === '*') break
+        if (s[j] === "'" || s[j] === '"' || s[j] === '`') break
+        if (s[j] === '[') {
+          j++
+          while (j < s.length && s[j] !== ']' && !isLineTerminator(s[j])) {
+            if (s[j] === '\\') { j += 2; continue }
+            j++
+          }
+          if (j < s.length && s[j] === ']') j++
+          continue
+        }
+        if (s[j] === '/') { closed = true; break }
+        j++
+      }
+      if (!closed) { i++; continue }
+      blankRange(i, j + 1)
+      i = j + 1
+      continue
+    }
+    i++
+  }
+  return out.join('')
+}
+
+function executableJsSurface(source) {
+  const input = String(source || '')
+  const output = input.split('')
+  let ambiguous = false
+  const isLineTerminator = (ch) => ch === '\n' || ch === '\r' || ch === '\u2028' || ch === '\u2029'
+  const blank = (i) => {
+    if (!isLineTerminator(output[i])) output[i] = ' '
+  }
+
+  function quoted(start, quote) {
+    blank(start)
+    for (let i = start + 1; i < input.length; i++) {
+      const ch = input[i]
+      blank(i)
+      if (ch === '\\') {
+        if (i + 1 < input.length) blank(++i)
+      } else if (ch === quote) {
+        return i + 1
+      }
+    }
+    return input.length
+  }
+
+  function lineComment(start) {
+    let i = start
+    while (i < input.length && !isLineTerminator(input[i])) blank(i++)
+    return i
+  }
+
+  function blockComment(start) {
+    let i = start
+    while (i < input.length) {
+      const closes = input[i] === '*' && input[i + 1] === '/'
+      blank(i++)
+      if (closes) {
+        if (i < input.length) blank(i++)
+        return i
+      }
+    }
+    return i
+  }
+
+  function templateCouldBeTagged(start) {
+    let i = start - 1
+    while (i >= 0 && /\s/u.test(input[i])) i--
+    if (i < 0) return false
+    if (input[i] === ')' || input[i] === ']' || input[i] === '}') return true
+    if (!/[A-Za-z0-9_$]/.test(input[i])) return false
+    const end = i + 1
+    while (i >= 0 && /[A-Za-z0-9_$]/.test(input[i])) i--
+    const word = input.slice(i + 1, end)
+    return !new Set(['return', 'throw', 'case', 'yield', 'await', 'else', 'do', 'typeof', 'void', 'delete', 'new', 'in', 'of', 'instanceof']).has(word)
+  }
+
+  function template(start) {
+    blank(start)
+    let i = start + 1
+    while (i < input.length) {
+      const ch = input[i]
+      if (ch === '\\') {
+        blank(i++)
+        if (i < input.length) blank(i++)
+      } else if (ch === '`') {
+        blank(i++)
+        return i
+      } else if (ch === '$' && input[i + 1] === '{') {
+        blank(i++)
+        blank(i++)
+        i = code(i, true)
+      } else {
+        blank(i++)
+      }
+    }
+    return i
+  }
+
+  function code(start, templateExpression) {
+    let braces = 0
+    let i = start
+    while (i < input.length && !ambiguous) {
+      const ch = input[i]
+      if (ch === "'" || ch === '"') {
+        i = quoted(i, ch)
+      } else if (ch === '`') {
+        if (templateCouldBeTagged(i)) {
+          ambiguous = true
+          break
+        }
+        i = template(i)
+      } else if (ch === '/' && input[i + 1] === '/') {
+        i = lineComment(i)
+      } else if (ch === '/' && input[i + 1] === '*') {
+        i = blockComment(i)
+      } else if (ch === '/') {
+        // Regex-vs-division requires a real parser. Preserve the raw source so
+        // the capability check fails closed instead of guessing the JS grammar.
+        ambiguous = true
+        break
+      } else if (ch === '{') {
+        braces++
+        i++
+      } else if (ch === '}') {
+        if (templateExpression && braces === 0) {
+          blank(i)
+          return i + 1
+        }
+        braces = Math.max(0, braces - 1)
+        i++
+      } else {
+        i++
+      }
+    }
+    return i
+  }
+
+  code(0, false)
+  return ambiguous ? blankJsDataRanges(input) : output.join('')
+}
+
+// ps1 检查 3：force push 完整检测（--force / -f / push +refs 语法 / --mirror）。
+// v17：只扫这一条 git push 的参数。整段文本会把同行 `rm -f` / `tail -f` /
+// `wget --mirror` 当成 force-push，逼模型改命令。
+const GIT_PUSH_VALUE_FLAGS = new Set([
+  '-o', '--push-option', '--repo', '--receive-pack', '--exec', '--recurse-submodules',
+])
+
+function forEachGitPushArg(args, visit) {
+  const list = Array.isArray(args) ? args : []
+  for (let i = 0; i < list.length; i++) {
+    const t = String(list[i])
+    const eq = t.indexOf('=')
+    const base = eq === -1 ? t : t.slice(0, eq)
+    if (GIT_PUSH_VALUE_FLAGS.has(t)) {
+      i++
+      continue
+    }
+    if (eq !== -1 && (GIT_PUSH_VALUE_FLAGS.has(base) || base === '--force-with-lease' || base === '--signed')) continue
+    if (visit(t) === true) return true
+  }
+  return false
+}
+
+function isForcePush(text) {
+  for (const inv of gitInvocations(text)) {
+    if (String(inv.sub).toLowerCase() !== 'push') continue
+    if (forEachGitPushArg(inv.args, (t) => {
+      if (t === '--force' || t === '--force=true' || t === '--force=1') return true
+      if (t === '-f' || (/^-[a-zA-Z0-9]+$/.test(t) && t.includes('f') && t !== '--follow-tags')) return true
+      if (t === '--mirror') return true
+      if (t.startsWith('+') && t.length > 1 && !/\s/.test(t)) return true
+      return false
+    })) return true
+  }
+  return false
+}
+
+// v3：push 目标是否含受保护分支（ps1 检查 3 的 explicitProtectedRef + pushAll 简化：
+// 裸 main/master token 或 refs/heads/main|master）。
+// v17：只扫「这一条」git push 的参数，不跨 ; / && / 换行吃进 gh --base main。
+function pushTargetsProtectedRef(text) {
+  for (const inv of gitInvocations(text)) {
+    if (String(inv.sub).toLowerCase() !== 'push') continue
+    if (forEachGitPushArg(inv.args, (t) => {
+      if (t === '--all') return true
+      if (/\s/.test(t)) return false
+      if (/^refs\/heads\/(?:main|master)$/.test(t)) return true
+      if (/(?:^|:)(?:refs\/heads\/)?(?:main|master)$/.test(t) && !t.startsWith('-')) return true
+      return false
+    })) return true
+  }
+  return false
+}
+
+// ps1 检查 3/4 ask 分支：会丢失本地工作的 Git 操作（人类确认点）。
+// 注意：\b 在 `--` 与空格之间不成立（两个非词字符），故 checkout -- 不带尾 \b；
+// clean -f 的 [a-z]*f 与 ps1 同式（无尾 \b，-fd 中 f 后是 d 仍应命中）。
+function isLocalDestructiveAsk(text) {
+  return (
+    /\breset\s+--hard\b/.test(text) ||
+    /\bclean\b[^;&|]*-[a-z]*f/.test(text) ||
+    /\bbranch\s+-D\b/.test(text) ||
+    /\bstash\s+(?:drop|clear)\b/.test(text) ||
+    /\bcheckout\s+--/.test(text) ||
+    /\brestore\b/.test(text)
+  )
+}
+
+// v3：用户级控制平面路径判定（修复项目级 settings.yaml 误伤）：
+//   限定 home 下的 .dsh 根、.agent-presets（全局唯一目录名）、安装副本
+//   agent.cordis.yml（preset 专属）。
+// v11：源仓库事实源 dsh/preset/ 与 en/preset/ 下的同名文件不是用户级安装
+//   副本——bare `agent.cordis.yml` 子串会把维护者对自己仓库的编辑当成
+//   CONTROL PLANE 误伤。安装副本仍走 .agent-presets / ~/.dsh 命中。
+function isSourceRepoPresetPath(low) {
+  // v15.1：豁免覆盖全部 preset 变体目录（preset / preset-classic /
+  // preset-classic-en / preset-null）。出生证明：2026-08-20 会话实弹——
+  // 编辑 dsh/preset-null/agent.cordis.yml（源仓库事实源）被裸 agent.cordis.yml
+  // 兜底分支误 remind；旧正则 /preset(?:\/|$)/ 匹配不到 preset-xxx 变体名。
+  // 安装面检查先于本豁免执行，~/.dsh 与 .agent-presets 路径不受影响。
+  return /(?:^|\/)(?:dsh|en)\/preset[-\w]*(?:\/|$)/.test(low)
+}
+function isInstallControlPlanePath(low) {
+  // v18.1（2026-09-08，QA 取证 P2）：DSH 宿主进程 environ 可无 HOME/USERPROFILE
+  // （实测 /proc/<pid>/environ 仅 6 个变量）→ 旧实现 home=''，/root/.dsh/... 等
+  // 绝对路径漏判控制平面。补 os.homedir() 兜底（HOME 缺失时走 passwd），
+  // 不放宽既有边界：仍只做「home 下的 .dsh」与安装面/显式 ~ 写法判定。
+  const home = (process.env.USERPROFILE || process.env.HOME || homedir() || '').toLowerCase().replace(/\\/g, '/')
+  return (
+    low.includes('.agent-presets') ||
+    (home !== '' && low.includes(home + '/.dsh')) ||
+    low.includes('~/.dsh') ||
+    low.includes('$home/.dsh') ||
+    low.includes('$env:userprofile/.dsh') ||
+    low.includes('%userprofile%/.dsh')
+  )
+}
+function targetsControlPlane(text) {
+  const low = String(text || '').toLowerCase().replace(/\\/g, '/')
+  // 安装面先于源路径豁免：挡住 dsh/preset/../../.dsh/.agent-presets 这类绕过。
+  if (isInstallControlPlanePath(low)) return true
+  if (isSourceRepoPresetPath(low)) return false
+  return low.includes('agent.cordis.yml')
+}
+
+const CONTROL_PLANE_REMIND =
+  'kix-guards: 正在改写用户级控制平面（~/.dsh / .agent-presets）。自迭代或用户已授权时可继续；改完请用新会话验证挂载，勿把安装副本当源仓库提交。'
+
+function makeUserMessage(text) {
+  return {
+    id: randomUUID(),
+    role: 'user',
+    content: [{ type: 'text', text }],
+    source: { kind: 'plugin', plugin: 'kix-guards', form: 'notice', summary: text.slice(0, 100) },
+  }
+}
+
+// ── v8：终端控制平面保护只拦「写意图」────────────────────────────────────
+// 旧实现仅凭命令文本出现 ~/.dsh / agent.cordis.yml 就 deny，grep/cat/ls 等
+// 只读诊断被误拦，违反机械层 0% 误报纪律。写意图判定：
+//   1. shell 重定向目标命中控制平面 → deny；
+//   2. 明确写/删/改动词，且控制平面路径位于其作用对象（删除/移动类任一
+//      参数命中；cp/install/ln/git-clone 只认最后一个非旗标参数 = 目标）→ deny。
+const CONTROL_PLANE_MODIFY_ANY = new Set([
+  'rm', 'del', 'erase', 'rd', 'rmdir', 'remove-item', 'ri',
+  'mv', 'move', 'move-item', 'mi', 'ren', 'rename', 'rename-item',
+  'touch', 'mkdir', 'md', 'new-item', 'ni', 'chmod', 'chown', 'icacls',
+  'attrib', 'set-content', 'sc', 'add-content', 'ac', 'clear-content', 'clc',
+  'out-file', 'set-item', 'si', 'tee',
+])
+const CONTROL_PLANE_DEST_LAST = new Set([
+  'cp', 'copy', 'copy-item', 'cpi', 'robocopy', 'install',
+  'ln', 'link', 'wget', 'curl', 'iwr', 'invoke-webrequest',
+])
+const DOWNLOAD_OUTPUT_FLAGS = new Set(['-o', '--output', '--output-document', '-outfile', '--outfile'])
+function downloadOutputTarget(args) {
+  for (let i = 0; i < args.length; i++) {
+    const raw = args[i]
+    if (DOWNLOAD_OUTPUT_FLAGS.has(raw.toLowerCase())) {
+      if (i + 1 < args.length) return args[i + 1]
+      continue
+    }
+    const eq = raw.match(/^(--output|--output-document|--outfile)=(.*)$/i)
+    if (eq) return eq[2]
+  }
+  return undefined
+}
+function lastNonFlagArg(args) {
+  for (let i = args.length - 1; i >= 0; i--) {
+    if (!args[i].startsWith('-')) return args[i]
+  }
+  return undefined
+}
+function redirectTargetsControlPlane(text) {
+  const re = /(?:[12]?>>?|&>)\s*(?:"([^"]*)"|'([^']*)'|([^\s;&|]+))/g
+  let m
+  while ((m = re.exec(text))) {
+    const target = m[1] || m[2] || m[3]
+    if (target && targetsControlPlane(target)) return true
+  }
+  return false
+}
+function isTerminalControlPlaneWrite(text) {
+  const t = String(text || '')
+  if (redirectTargetsControlPlane(t)) return true
+  const parts = splitShellSegments(t)
+  for (const part of parts) {
+    const tokens = shellTokens(part.text)
+    const cmd = leadingCommand(tokens)
+    if (!cmd) continue
+    if (CONTROL_PLANE_MODIFY_ANY.has(cmd.name)) {
+      if (cmd.args.some((a) => targetsControlPlane(a))) return true
+      continue
+    }
+    if (cmd.name === 'wget' || cmd.name === 'curl' || cmd.name === 'iwr' || cmd.name === 'invoke-webrequest') {
+      const out = downloadOutputTarget(cmd.args)
+      if (out && targetsControlPlane(out)) return true
+      continue
+    }
+    if (CONTROL_PLANE_DEST_LAST.has(cmd.name)) {
+      const dest = lastNonFlagArg(cmd.args)
+      if (dest && targetsControlPlane(dest)) return true
+      if ((cmd.name === 'mv' || cmd.name === 'move' || cmd.name === 'move-item' || cmd.name === 'mi') &&
+        cmd.args.some((a) => targetsControlPlane(a))) return true
+      continue
+    }
+    if (cmd.name === 'git' && /^clone$/i.test(cmd.args[0] || '')) {
+      const dest = lastNonFlagArg(cmd.args.slice(1))
+      if (dest && targetsControlPlane(dest)) return true
+    }
+  }
+  return false
+}
+
+// 仓库根解析：git -C 参数提取（budget/分支检查共用）
+function repoRootFromText(text) {
+  for (const part of splitShellSegments(text)) {
+    const command = leadingCommand(shellTokens(part.text))
+    if (!command) continue
+    if (command.name === 'git') {
+      const tokens = command.args
+      for (let i = 0; i < tokens.length; i++) {
+        const t = tokens[i]
+        if (t === '--') break
+        if (t === '-C' && i + 1 < tokens.length) return tokens[i + 1]
+        if (t.startsWith('-C') && t.length > 2) return t.slice(2)
+        if (GIT_GLOBAL_OPTIONS_WITH_VALUE.has(t)) {
+          if (i + 1 < tokens.length) i++
+          continue
+        }
+        if (t.startsWith('-')) continue
+        break
+      }
+      continue
+    }
+    if (command.name === 'cd' && command.args[0]) return command.args[0]
+  }
+  return undefined
+}
+
+// v7：reflog 计数（%gs 口径）——只数 commit 类条目，不惩罚历史修整。
+//   commits = 逻辑 commit（commit: / commit (initial):；不含 amend）
+//   churn   = commit 对象创建（含 commit (amend):）→ hard cap 口径
+//   reset / merge / pull / checkout / rebase 等 HEAD 移动不计入任何口径：
+//   它们不创建 commit 对象，且 reset+recommit / rebase 是推荐的历史修整
+//   工作流（实测误报根因之一：修 off-by-one 的 reset 重做被计进预算）。
+//   amend 不计入 budget（不改逻辑 commit 数）但计入 hard cap（防无限重写）。
+function countReflogCommits(reflogText) {
+  const lines = String(reflogText || '').split('\n').map((l) => l.trim()).filter(Boolean)
+  let commits = 0
+  let churn = 0
+  for (const s of lines) {
+    if (s.startsWith('commit')) churn++
+    if (s.startsWith('commit:') || s.startsWith('commit (initial):')) commits++
+  }
+  return { commits, churn }
+}
+
+// 预算解析（ps1 同源正则；progress.md 优先 → plan.md 两级 → 冷启动默认）
+// v7：plan.md 增读 blast_radius.max_commits 兜底（sprint-9 实形：progress
+// 无 commit_budget、plan 无 task_sizing，但 plan 的 blast_radius.max_commits
+// 是 ps1 同源锁定的提交上限——此前读不到会静默落冷启动 3）。
+// v7 修正优先级语义：按「是否匹配到」降级，不再按「值是否等于默认」——
+// 显式 commit_budget: 3 不再被 plan 兜底覆盖（v6 潜伏 bug，兜底链放大）。
+function resolveCommitBudget({ progressMd, planMd }) {
+  let budget = COMMIT_BUDGET_DEFAULT
+  let fromProgress = false
+  if (progressMd) {
+    const m = /^---[\s\S]*?blast_radius:[\s\S]*?commit_budget:\s*(\d+)/.exec(progressMd)
+    if (m) { budget = Number(m[1]); fromProgress = true }
+  }
+  if (!fromProgress && planMd) {
+    const m = /task_sizing:[\s\S]*?derived_commit_budget:\s*(\d+)/.exec(planMd)
+    if (m) {
+      budget = Number(m[1])
+    } else {
+      const m2 = /blast_radius:[\s\S]*?max_commits:\s*(\d+)/.exec(planMd)
+      if (m2) budget = Number(m2[1])
+    }
+  }
+  return budget
+}
+
+// v7：预算来源标注（冷启动 warn / deny 消息用；与 resolveCommitBudget 同优先级链）
+function commitBudgetSource({ progressMd, planMd }) {
+  if (progressMd && /^---[\s\S]*?blast_radius:[\s\S]*?commit_budget:\s*(\d+)/.test(progressMd)) return 'progress.md blast_radius.commit_budget'
+  if (planMd && /task_sizing:[\s\S]*?derived_commit_budget:\s*(\d+)/.test(planMd)) return 'plan.md task_sizing.derived_commit_budget'
+  if (planMd && /blast_radius:[\s\S]*?max_commits:\s*(\d+)/.test(planMd)) return 'plan.md blast_radius.max_commits'
+  return '冷启动默认 ' + COMMIT_BUDGET_DEFAULT
+}
+
+// v15 预算线结算 steer 的消息文本（纯函数，单测直接验证；结算式措辞——
+// 不指责、不推断意图，只要求显式对账：同步预算或声明失败驱动链）
+function budgetSteerMessage({ commits, budget, source, sprintDir, staleAll }) {
+  const staleNote = staleAll ? `；注意：预算基线来自已完结的 ${sprintDir || 'sprint'}` : ''
+  return `BLAST RADIUS 结算提醒（本会话一次）：commit 已放行——最近 1 小时窗口内 commits=${commits}，预算 ${budget}（来源：${sprintDir ? sprintDir + ' 的 ' : ''}${source}${staleNote}）。请在收尾前对账其一：① 迭代节奏真实变快（如 CI 修复链）→ 重算 commit_budget 并同步 progress.md frontmatter；② 预算合理而提交超速 → 收敛提交粒度或拆分 Sprint。硬上限 ${COMMIT_HARD_CAP} 次/小时（含 amend，不可配）仍直接拦截。`
+}
+
+// 找 active sprint 目录（ps1：docs/.kixpower-current-sprint 优先 → 最大数字）
+function activeSprintDir(docsRoot, currentSprint) {
+  const fs = require('node:fs')
+  let entries = []
+  try {
+    entries = fs.readdirSync(docsRoot, { withFileTypes: true })
+  } catch {
+    return undefined
+  }
+  const sprints = entries
+    .filter((e) => e.isDirectory() && /^sprint-\d+$/.test(e.name))
+    .map((e) => ({ name: e.name, n: Number(e.name.slice(7)) }))
+    .sort((a, b) => b.n - a.n)
+  if (currentSprint > 0) {
+    const hit = sprints.find((s) => s.n === currentSprint)
+    if (hit) return hit.name
+  }
+  return sprints.length > 0 ? sprints[0].name : undefined
+}
+
+// v7：active sprint 目录解析 + 完结检测（纯 fs 进出，供单元测试）。
+//   marker（docs/.kixpower-current-sprint）优先；若其指向的 sprint 已有
+//   done.md（已完结，预算基线过期）→ fallbackFrom 记录并回退最大编号目录
+//   （实测误报根因之二：marker 停在已完结的 sprint-6，门禁拿其 budget=3
+//   约束之后的工作）。最大编号也已完结 → staleAll（由调用方 warn + 标注）。
+function resolveSprintContextPaths(docsRoot, currentSprint) {
+  const fs = require('node:fs')
+  const dir = activeSprintDir(docsRoot, currentSprint)
+  if (!dir) return undefined
+  const out = { dir, fallbackFrom: undefined, staleAll: false }
+  let done = false
+  try { done = fs.statSync(join(docsRoot, dir, 'done.md')).isFile() } catch { done = false }
+  if (!done) return out
+  const maxDir = activeSprintDir(docsRoot, 0)
+  if (maxDir && maxDir !== dir) {
+    out.fallbackFrom = dir
+    out.dir = maxDir
+    try { out.staleAll = fs.statSync(join(docsRoot, maxDir, 'done.md')).isFile() } catch { out.staleAll = false }
+  } else {
+    out.staleAll = true // 最大编号即 marker 指向且已完结
+  }
+  return out
+}
+
+// v19：把 kix_capability_call 的内层 GitHub 工具摊开，供门禁 5 与 denyMemo 共用。
+// DSH 0.1.2-rc.1 下 MCP 代理走全局 execute，外层 capability_call 才看得到本监听器。
+function githubCallTarget(name, args, prefixRe) {
+  const re = prefixRe || /^mcp__github__/
+  if (name === 'kix_capability_call' && args && typeof args.tool === 'string' && re.test(args.tool)) {
+    const inner = args.arguments
+    const innerArgs = inner && typeof inner === 'object' && !Array.isArray(inner) ? inner : {}
+    return { name: args.tool, args: innerArgs }
+  }
+  if (name && re.test(name)) {
+    return { name, args: args && typeof args === 'object' && !Array.isArray(args) ? args : {} }
+  }
+  return null
+}
+
+module.exports = {
+  name: 'kix-guards',
+  inject: ['tools'],
+  apply(ctx, config) {
+    const cfg = config || {}
+    // v8：GitHub MCP 命名前缀可配置（不同部署命名不是 mcp__github__ 时，
+    // 旧硬编码会让整个 GitHub 写保护静默失效）。
+    const GH_PREFIX = String(cfg.githubToolPrefix || 'mcp__github__')
+    const GH_RE = new RegExp('^' + escapeRegex(GH_PREFIX))
+    const DENY = (reason) => ({ kind: 'deny', reason })
+    // v6：会话内重复尝试记忆（key → 原拒绝原因；只记录拒绝，用户放行不记）
+    const denyMemo = new Map()
+    // v12：控制平面软提醒（每会话一次；投递成功才消耗）
+    const pendingControlPlane = new Map()
+    let controlPlaneReminded = false
+    // v15：预算线结算 steer（每会话一次；投递成功才消耗）
+    const pendingBudgetSteer = new Map()
+    let budgetSteerReminded = false
+
+    function queueControlPlaneRemind(exec) {
+      if (controlPlaneReminded) return
+      const callId = exec && exec.callId
+      if (callId) pendingControlPlane.set(callId, CONTROL_PLANE_REMIND)
+    }
+
+    // ── 工具分类 ──────────────────────────────────────────────────────────
+    const TERMINAL_TOOLS = new Set(['pwsh', 'bash'])
+    const EDIT_TOOLS = new Set(['write', 'edit'])
+    const SQL_TOOLS = new Set(['sql', 'sql_execute', 'run_sql'])
+    const KNOWN_SAFE_TOOLS = new Set([
+      'read', 'grep', 'glob', 'web_search', 'skill', 'ask_user_question',
+      'todo_write', 'job_output', 'job_list', 'job_kill', 'subagent',
+      'subagent_fork', 'subagent_cross', 'send_message', 'list_agents',
+      'read_image', 'get_goal', 'create_goal', 'update_goal',
+      'workflow', 'ralph', 'plan', 'exit_plan_mode', 'interrupt_agent',
+      'cordis_inspect_list', 'cordis_inspect_query', 'cordis_inspect_self',
+      'cordis_define', 'cordis_run', 'cordis_stop', 'cordis_undefine',
+      // SQL 工具：v3 起入白名单（否则门禁 1 的 /run|exec/ 正则先拒，门禁 4 死代码）
+      'sql', 'sql_execute', 'run_sql',
+      // kix-focus 渐进披露：发现目录 + 代理入口。MCP 代理走全局 execute，
+      // 本监听器看不到内层 MCP；GitHub 写靠 unwrap kix_capability_call.tool。
+      // 白名单只防门禁 1 正则误伤（名字本身不含 exec/run）。
+      'kix_capability_search', 'kix_capability_call',
+      // PTC/Code Mode 呈现（mode: both）：run_code 是保留传输；KIX 不扫描
+      // 其代码体，原生 Node 副作用与 bash 同级信任。SDK 子分派仍走完整
+      // pre-execute 管线，本门禁对程序内每个 tools.* 调用依然拦截。
+      'run_code',
+      // RLM 持久内核（kixrlm 融合，2026-09-22）：ipython 是 preset 自带的
+      // 一方执行通道（名字含 "python" 命中门禁 1 正则）；信任级与
+      // run_code/bash 一致——内核非沙箱，安全边界在 fs/bash sandbox 层。
+      // 未挂载该工具的 preset 里此行是死条目，无行为影响。
+      'ipython',
+    ])
+
+    // 危险 git 子命令（写操作；branch 亦含破坏性 -D 分支删除）
+    // v10.1（2026-08-17，部署 E2E 复验实锤）：补上 `commit`——原清单缺它，
+    // isGitWrite() 对纯 `git commit` 返回 false → 2b 门禁整体跳过 → 分支/
+    // 预算检查（checkGitCommit，v10 的 cd 解析落点）对普通 commit 永不执行，
+    // main 分支直接 commit 静默放行（此前 v10 修复只覆盖了 resolveRepoRoot，
+    // 单测也只测 repoRootFromText 未测整链，缺陷长期潜伏）。
+    const DANGEROUS_GIT = new Set([
+      'push', 'commit', 'reset', 'rebase', 'merge', 'cherry-pick', 'revert', 'clean',
+      'checkout', 'restore', 'stash', 'branch', 'rm', 'mv', 'gc', 'prune', 'reflog',
+      'update-ref', 'symbolic-ref', 'commit-tree', 'fast-import',
+      'hash-object', 'replace', 'am', 'apply', 'pull',
+    ])
+
+    function commandText(args) {
+      const cmd = args && (args.command || args.cmd)
+      if (typeof cmd === 'string') return cmd
+      if (args && Array.isArray(args.argv)) return args.argv.join(' ')
+      return ''
+    }
+
+    // v3：解析式子命令检测（isGitWrite 门）
+    function isGitWrite(text) {
+      if (!/\bgit(?:\.exe)?\b/.test(text)) return false
+      const subs = gitSubcommands(text)
+      for (const sub of subs) {
+        if (DANGEROUS_GIT.has(sub)) return true
+      }
+      return false
+    }
+
+    // ── agent 会话 cwd（budget/分支检查的仓库根 fallback）─────────────────
+    function agentCwd(exec) {
+      try {
+        const cwd = exec && exec.agent && exec.agent.session && exec.agent.session.header && exec.agent.session.header.cwd
+        return typeof cwd === 'string' && cwd.length > 0 ? cwd : undefined
+      } catch {
+        return undefined
+      }
+    }
+    function resolveRepoRoot(text, exec) {
+      const fromText = repoRootFromText(text)
+      if (fromText) return fromText
+      const cwd = agentCwd(exec)
+      if (cwd) return cwd
+      return undefined
+    }
+
+    // ── git 只读查询（reflog 计数 / 当前分支）─────────────────────────────
+    async function gitRead(repoRoot, args) {
+      try {
+        const { stdout } = await execFileP('git', args, {
+          cwd: repoRoot,
+          timeout: 5000,
+          windowsHide: true,
+          maxBuffer: 1024 * 1024,
+        })
+        return stdout
+      } catch {
+        return null
+      }
+    }
+
+    // 读取 sprint 上下文文件内容（供预算解析；任何失败返回空对象不拦）
+    // v7：经 resolveSprintContextPaths 做「marker 指向已完结 sprint」的
+    // 回退，并携带 sprintDir / staleAll 供 deny 消息标注预算基线状态。
+    async function readSprintContext(repoRoot) {
+      const docsRoot = join(repoRoot, 'docs')
+      let currentSprint = 0
+      try {
+        const raw = await readFile(join(docsRoot, '.kixpower-current-sprint'), 'utf8')
+        const n = Number(raw.trim())
+        if (Number.isInteger(n) && n > 0) currentSprint = n
+      } catch { /* 无 current-sprint 文件 */ }
+      const resolved = resolveSprintContextPaths(docsRoot, currentSprint)
+      if (!resolved) return {}
+      if (resolved.fallbackFrom) {
+        ctx.logger?.warn?.(`[kix-guards] active sprint 指针指向已完结的 ${resolved.fallbackFrom}（done.md 存在），回退到最大编号 ${resolved.dir} 解析预算——请同步 docs/.kixpower-current-sprint 或开新 sprint。`)
+      }
+      if (resolved.staleAll) {
+        ctx.logger?.warn?.(`[kix-guards] 最大编号 sprint ${resolved.dir} 也已完结（done.md 存在）——预算基线可能不反映当前工作，建议开新 sprint 并写明 blast_radius.commit_budget。`)
+      }
+      const sprintRoot = join(docsRoot, resolved.dir)
+      const out = { sprintDir: resolved.dir, staleAll: resolved.staleAll }
+      try { out.progressMd = await readFile(join(sprintRoot, 'progress.md'), 'utf8') } catch { /* 无 progress.md */ }
+      try { out.planMd = await readFile(join(sprintRoot, 'plan.md'), 'utf8') } catch { /* 无 plan.md */ }
+      return out
+    }
+
+    // ── v15: 预算线结算 steer ───────────────────────────────────────────────
+    // 超预算不拦 commit（可逆、本地），改为结算提醒：pre 放行 + 记 pending，
+    // post（工具真实成功后）注入一次对账文本（v12 控制平面同款机制）。
+    // 意图不被推断（v14 regex 分类已判死，见头部死亡证明）——超额本身在结算
+    // 时显式交代。near-miss 日志是 fuse 校准的测度点。
+    function queueBudgetSteer(exec, text) {
+      if (budgetSteerReminded) return
+      const callId = exec && exec.callId
+      if (callId) pendingBudgetSteer.set(callId, text)
+    }
+
+    // ── git commit 前置检查（budget + feature branch）────────────────────
+    // 返回 decision 或 undefined（无法解析仓库根 → 放行 + warn）
+    async function checkGitCommit(text, exec) {
+      const repoRoot = resolveRepoRoot(text, exec)
+      if (!repoRoot) {
+        ctx.logger?.warn?.('[kix-guards] git commit 无法解析仓库根，跳过 budget/分支检查')
+        return undefined
+      }
+      // 分支检查（ps1 检查 4）
+      const branch = (await gitRead(repoRoot, ['rev-parse', '--abbrev-ref', 'HEAD']))?.trim()
+      if (branch === 'main' || branch === 'master') {
+        return DENY(`BLAST RADIUS: 禁止在 ${branch} 分支直接 commit。先创建 feature 分支并通过 PR/MR 合并。`)
+      }
+      // commit budget（ps1 检查 1；v7：%gs 口径只数 commit 类条目，
+      // reset/merge/pull/checkout/rebase 与 budget 无关，amend 只进 hard cap）
+      const reflog = await gitRead(repoRoot, ['reflog', '--since=1 hour ago', '--format=%gs', 'HEAD'])
+      if (reflog === null) return undefined
+      const { commits, churn } = countReflogCommits(reflog)
+      if (churn >= COMMIT_HARD_CAP) {
+        return DENY(`BLAST RADIUS HARD CAP: 1 小时窗口内已创建 ${churn} 个 commit（含 amend；绝对硬上限 ${COMMIT_HARD_CAP}）。立即停止并拆分 Sprint；不得从 plan.md 覆盖硬上限。`)
+      }
+      const { progressMd, planMd, sprintDir, staleAll } = await readSprintContext(repoRoot)
+      const budget = resolveCommitBudget({ progressMd, planMd })
+      const source = commitBudgetSource({ progressMd, planMd })
+      if (source.startsWith('冷启动')) {
+        ctx.logger?.warn?.(`[kix-guards] commit 预算落到冷启动默认 ${COMMIT_BUDGET_DEFAULT}（未在 sprint 文档解析到 commit_budget / derived_commit_budget / max_commits）——请在新 sprint 的 progress.md frontmatter 写明 blast_radius.commit_budget。`)
+      }
+      // v15: 预算线 = 结算 steer（放行 + 对账提醒），fuse 见上方 hard cap。
+      // 确定性谓词（commits >= budget），触发条件 0% 误报；每会话提醒一次。
+      if (commits >= budget) {
+        ctx.logger?.warn?.(`[kix-guards] budget-steer near-miss: commits=${commits} budget=${budget} source=${source} fuse=${COMMIT_HARD_CAP}（测度点：攒 sprint 数据校准默认值与 fuse）`)
+        queueBudgetSteer(exec, budgetSteerMessage({ commits, budget, source, sprintDir, staleAll }))
+      }
+      return undefined
+    }
+    // ── MCP GitHub 远程写保护（ps1 检查 5）────────────────────────────────
+    // 只读工具（get_/list_/search_*）直接放行；write 类（写文件/推分支）必须
+    // 显式提供非 main/master 的 branch；mutation 类：聊天内提问确认（v5）。
+    // v4（2026-08-15）：按工具名精确匹配，废除"包含子串"式正则——旧实现
+    // `.*request_` 把 get_pull_request_files/comments/reviews/status 等只读
+    // 工具误判为 mutation（日志实测：PR 审查会话中 get_pull_request_files 被
+    // ASK，agent 被迫全程绕道 gh CLI，只读调用被拒会打断审查流程）。
+    const GITHUB_READ = new RegExp('^' + escapeRegex(GH_PREFIX) + '(get|list|search)_')
+    const GITHUB_WRITE = new RegExp('^' + escapeRegex(GH_PREFIX) + '(create_or_update_file|delete_file|push_files)$')
+    const GITHUB_MUTATION = new Set([
+      'create_issue',
+      'create_pull_request',
+      'create_pull_request_review',
+      'create_repository',
+      'create_branch',
+      'update_issue',
+      'update_pull_request_branch',
+      'add_issue_comment',
+      'merge_pull_request',
+      'fork_repository',
+    ].map((suffix) => GH_PREFIX + suffix))
+    function checkGitHubWrite(name, args) {
+      if (GITHUB_READ.test(name)) return undefined
+      if (GITHUB_WRITE.test(name)) {
+        const branch = args && (args.branch || args.target_branch || args.ref)
+        if (!branch) {
+          return DENY('BLAST RADIUS: GitHub 远程写入未提供目标 branch，无法确认不是 main/master。请显式提供 feature branch。')
+        }
+        if (branch === 'main' || branch === 'master') {
+          return DENY('BLAST RADIUS: 禁止通过 GitHub 工具直接写 main/master。写入 feature 分支并通过 PR 合并。')
+        }
+        return undefined
+      }
+      if (GITHUB_MUTATION.has(name)) {
+        // v9：软约束——是否发布/评论由 persona + review 流程判断；用户明确指示
+        // 即已决策，机械层不再重复提问。
+        return undefined
+      }
+      return undefined
+    }
+
+    // ── pre-execute 监听器（自动拦截）─────────────────────────────────────
+    ctx.on('tools/pre-execute', async (exec, next) => {
+      const name = exec && exec.name
+      // DSH 契约：参数在 exec.arguments（createExecution 的 {...base, arguments}），
+      // 兼容旧字段名 exec.args（历史 bug 根因，2026-08-15 修复）。
+      const args = exec && (exec.arguments ?? exec.args)
+      const text = commandText(args)
+      const tool = (name || '').toLowerCase()
+
+      // v6：重复尝试记忆——同操作已被拒（硬 deny / 用户拒绝）→ 直接 deny，
+      // 附原拒绝原因 + 禁止重复尝试，不再反复提问（堵「反复重复」反馈）。
+      const pathArg = args && typeof (args.file_path ?? args.path) === 'string' ? (args.file_path ?? args.path) : undefined
+      let memoKey = null
+      if (TERMINAL_TOOLS.has(tool) && text) memoKey = 'term::' + normalizeMemo(text)
+      else if (EDIT_TOOLS.has(tool) && pathArg) memoKey = 'edit::' + normalizeMemo(pathArg)
+      const ghCall = githubCallTarget(name, args, GH_RE)
+      if (!memoKey && ghCall) memoKey = 'ghub::' + ghCall.name + '::' + stableArgs(ghCall.args)
+      if (memoKey && denyMemo.has(memoKey)) {
+        return DENY(`BLAST RADIUS: 该操作此前已被拒绝（${denyMemo.get(memoKey)}）。禁止重复尝试；如确需执行，请向用户说明原因并等待其明确指示。`)
+      }
+      const deny = (reason) => {
+        if (memoKey) denyMemo.set(memoKey, reason)
+        return DENY(reason)
+      }
+      // 1. 未知代码执行工具（无副作用的脚本类）→ deny
+      if (/exec|run|eval|shell|snippet|python|node|jupyter|pylance|debug|repl|kernel|interpreter/.test(tool) && !KNOWN_SAFE_TOOLS.has(tool)) {
+        return deny(`BLAST RADIUS: 未登记的工具 ${name} 无法验证副作用，拒绝执行。`)
+      }
+
+      // 2. 终端命令门禁
+      if (TERMINAL_TOOLS.has(tool) && text) {
+        // 2a. 破坏性 SQL —— v3 起仅限数据库客户端上下文（ps1 检查 2 终端部分；
+        //     grep/echo 等裸文本不再误拦）
+        if (isTerminalDestructiveSql(text)) {
+          return deny('BLAST RADIUS: 终端数据库客户端中的破坏性 SQL（DELETE/UPDATE without WHERE / DROP/TRUNCATE/ALTER）已拦截。请改用结构化工具或先在事务/只读副本中验证。')
+        }
+        // 2b. git 写保护（v3：解析式子命令门；v9：确认类操作软约束，不再提问）
+        if (isGitWrite(text)) {
+          if (isForcePush(text)) {
+            return deny('BLAST RADIUS: git push --force 会重写远端历史。需用户明确确认；优先使用 --force-with-lease 或 git revert。')
+          }
+          // v9：本地破坏性 git 仅软约束，不提问；硬保护仍由 force-push/main 等 deny 承担。
+          if (pushTargetsProtectedRef(text)) {
+            return deny('BLAST RADIUS: 禁止直接 push 到 main/master。请推送 feature 分支并通过 PR 合并。')
+          }
+          // v9：普通 push 仅软约束，不提问；受保护分支/force push 仍 deny。
+          if (hasGitSubcommand(text, 'commit')) {
+            const decision = await checkGitCommit(text, exec)
+            if (decision) return decision
+          }
+        }
+        // 2c. 控制平面保护（v8：只拦明确写意图；v12：硬 deny → remind）
+        if (isTerminalControlPlaneWrite(text)) {
+          queueControlPlaneRemind(exec)
+        }
+        // 2d. gh CLI（GitHub CLI）写保护（v6：堵「经 pwsh 调 gh 绕过 MCP GitHub 门禁」）
+        if (isGhDestructive(text)) {
+          return deny('BLAST RADIUS: gh 破坏性操作（repo delete / api DELETE / release delete）会删除远程数据，禁止执行。')
+        }
+        // v9：gh 普通写操作仅软约束，不提问；gh 破坏性删除仍 deny。
+      }
+
+      // 3. 编辑工具控制平面保护（v12：硬 deny → remind，自迭代可写安装副本）
+      if (EDIT_TOOLS.has(tool) && args) {
+        const path = args.file_path || args.path || ''
+        if (typeof path === 'string' && targetsControlPlane(path)) {
+          queueControlPlaneRemind(exec)
+        }
+      }
+
+      // 4. SQL 工具门禁（v3：SQL_TOOLS 已入 KNOWN_SAFE_TOOLS，此门禁可达）
+      if (SQL_TOOLS.has(tool)) {
+        const sql = args && (args.sql || args.query || args.statement)
+        if (typeof sql === 'string' && isDestructiveSql(sql)) {
+          return deny('BLAST RADIUS: 破坏性 SQL（DELETE/UPDATE without WHERE / DROP/TRUNCATE/ALTER）已拦截。')
+        }
+      }
+
+      // 5. MCP GitHub 远程写保护（v9：mutation 软约束；write main/缺 branch 仍 deny）
+      // v19：capability_call 内层 GitHub 写与直呼走同一 checkGitHubWrite。
+      if (ghCall) {
+        const decision = checkGitHubWrite(ghCall.name, ghCall.args)
+        if (decision) return decision
+      }
+
+      return next()
+    })
+
+    ctx.on('tools/post-execute', async (exec, result, next) => {
+      const callId = exec && exec.callId
+      // v12 控制平面提醒 / v15 预算结算 steer：同一投递通道，各自独立 once。
+      // 只在工具真实成功后注入（失败/被拦的调用不产生结算义务）。
+      let from = null
+      let pending
+      if (callId) {
+        if (pendingControlPlane.has(callId)) {
+          from = 'controlPlane'
+          pending = pendingControlPlane.get(callId)
+          pendingControlPlane.delete(callId)
+        } else if (pendingBudgetSteer.has(callId)) {
+          from = 'budgetSteer'
+          pending = pendingBudgetSteer.get(callId)
+          pendingBudgetSteer.delete(callId)
+        }
+      }
+      if (from === null) return next()
+      if (from === 'budgetSteer') {
+        if (budgetSteerReminded) return next()
+        budgetSteerReminded = true
+      } else {
+        if (controlPlaneReminded) return next()
+        controlPlaneReminded = true
+      }
+      return { kind: 'accept', additionalContexts: [makeUserMessage(pending)] }
+    })
+
+    // 记录挂载
+    ctx.on('ready', () => {
+      ctx.logger?.info?.('[kix-guards] 机械门禁监听器已挂载（v15：预算线=结算 steer，硬 deny 仅 fuse/不可逆破坏）')
+    })
+  },
+}
+
+// ── 纯逻辑导出（单元测试用，不影响 DSH loader）────────────────────────────
+module.exports.__internals = {
+  isDestructiveSql,
+  stripSqlNoise,
+  isTerminalDestructiveSql,
+  splitShellSegments,
+  shellTokens,
+  leadingCommand,
+  extractSqlPayload,
+  isTerminalControlPlaneWrite,
+  redirectTargetsControlPlane,
+  isForcePush,
+  isLocalDestructiveAsk,
+  pushTargetsProtectedRef,
+  gitInvocations,
+  gitSubcommands,
+  hasGitSubcommand,
+  targetsControlPlane,
+  repoRootFromText,
+  resolveCommitBudget,
+  commitBudgetSource,
+  budgetSteerMessage,
+  countReflogCommits,
+  activeSprintDir,
+  resolveSprintContextPaths,
+  ghInvocations,
+  ghEntityAction,
+  isGhMutation,
+  isGhDestructive,
+  normalizeMemo,
+  stableArgs,
+  escapeRegex,
+  githubCallTarget,
+  executableJsSurface,
+  COMMIT_HARD_CAP,
+  COMMIT_BUDGET_DEFAULT,
+  CONTROL_PLANE_REMIND,
+  makeUserMessage,
+}

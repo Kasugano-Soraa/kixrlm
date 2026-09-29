@@ -1,0 +1,754 @@
+'use strict'
+// kixparadigm consistency-lib — 一致性守护纯函数核心（2026-08-17，P5 提取）
+//
+// 单一事实源：scripts/check-dsh-consistency.cjs（zh 全量入口）、
+// en/scripts/check-consistency.cjs（en 包全量入口）、
+// plugins/kix-consistency.js（写时增量拦截）三者共用本文件——
+// 防「CI 一套、运行时一套」双源漂移（与 kix「消灭双源」范式一致）。
+//
+// 约定：本文件不打印、不改进程退出码；所有检查返回 { failures: string[], notes: string[] }。
+// 消息统一英文（zh/en 字节一致约束）。ROOT 由调用方传入（脚本传包根，插件传工作区根）。
+// 不依赖第三方包。
+
+const fs = require('node:fs')
+const path = require('node:path')
+const { spawnSync } = require('node:child_process')
+
+// ── 基础工具 ──────────────────────────────────────────────────────────────
+function read(root, rel) {
+  try {
+    return fs.readFileSync(path.join(root, rel), 'utf8')
+  } catch {
+    return null
+  }
+}
+
+function walk(dir) {
+  const out = []
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    const p = path.join(dir, entry.name)
+    if (entry.isDirectory()) out.push(...walk(p))
+    else out.push(p)
+  }
+  return out
+}
+
+// 近似 o200k token 估算：CJK 字符按 ~1.05、英文词按 ~0.75、其余字符按 ~0.4。
+// 保守预算代理，不是 tokenizer；精确数在文档中记录，精确回归由阈值变化触发人工复核。
+function estimateTokens(text) {
+  const s = String(text || '')
+  const cjk = (s.match(/[\u3400-\u9fff]/g) || []).length
+  const words = (s.match(/[A-Za-z0-9_]+(?:[.'-][A-Za-z0-9_]+)*/g) || []).length
+  const other = Math.max(0, s.length - cjk - (s.match(/[A-Za-z0-9_]/g) || []).length)
+  return Math.ceil(cjk * 1.05 + words * 0.75 + other * 0.4)
+}
+
+// ── 检查项（全部返回 { failures, notes }，无 console 副作用）──────────────
+
+// v1.3.4：persona 预算单源（曾双源漂移：runAllZh 用 6000/3400、运行时插件
+// kix-consistency.js 用 4500/2600——同一检查两套阈值，正是本库使命要消灭的
+// CI/运行时双源形态，阈值本身逃逸了单源）。en 预算放宽：CJK 密度低 →
+// chars 高、tokens 低。
+const PERSONA_BUDGETS = {
+  zh: { maxChars: 4500, maxEstTokens: 2600 },
+  en: { maxChars: 9500, maxEstTokens: 2600 },
+}
+
+// v1.3.4：只计「活跃常驻层」——disabled 条目的 text 块是遗产/回退资产，
+// 不注入会话，不计入预算。失真实证：v1.3.0 起 dsh/preset 含 disabled 经典
+// 块 4160 chars，旧口径把死文本计入「常驻预算」报 5510>4500，而真实活跃层
+// （persona-incentive）仅 1274 chars。语义：persona = agent-instructions
+// 锚点前所有非 disabled 条目 text 块（6 空格缩进内容）之和，不含条目脚手架。
+function extractPersona(root, rel) {
+  const text = read(root, rel)
+  if (text === null) return { persona: null, error: `${rel}: unreadable` }
+  const end = text.indexOf('- id: agent-instructions')
+  if (end < 0) {
+    return { persona: null, error: `${rel}: persona block or agent-instructions anchor not found` }
+  }
+  const lines = text.slice(0, end).split(/\r?\n/)
+  const blocks = []
+  let inEntry = false
+  let disabled = false
+  let collecting = false
+  for (const line of lines) {
+    if (/^- id: \S+/.test(line)) {
+      inEntry = true
+      disabled = false
+      collecting = false
+      continue
+    }
+    if (!inEntry) continue
+    // 条目级键 2 空格缩进（name/disabled）；config 子键 4 空格（text）；
+    // text 内容 6+ 空格——文本行内出现 "disabled: true" 字样不会误判
+    // （6 空格缩进不匹配 2 空格锚定）。
+    if (/^ {2}disabled:\s*true\s*$/.test(line)) {
+      disabled = true
+      collecting = false
+      continue
+    }
+    // v1.3.16：persona 行改用 YAML 锚点（text: &kix_x |- / prefix: *kix_x），
+    // text 与 prefix 同源；锚点可选前缀由本正则吸收，预算仍按单份文本计。
+    if (/^ {4}text: (?:&\S+ )?\|-\s*$/.test(line)) {
+      collecting = !disabled
+      if (collecting) blocks.push([])
+      continue
+    }
+    if (collecting) {
+      if (/^ {6}/.test(line) || line.trim() === '') {
+        blocks[blocks.length - 1].push(line)
+        continue
+      }
+      collecting = false
+    }
+  }
+  const dedented = blocks.map((b) =>
+    b
+      .map((line) => {
+        if (/^ {6}/.test(line)) return line.slice(6)
+        return line.replace(/^\s+/, '')
+      })
+      .join('\n'),
+  )
+  return { persona: dedented.join('\n').trim() }
+}
+
+function checkPersonaBudget({ root, rel, maxChars, maxEstTokens }) {
+  const failures = []
+  const notes = []
+  const { persona, error } = extractPersona(root, rel)
+  if (error) return { failures: [error], notes }
+  const chars = persona.length
+  const tokens = estimateTokens(persona)
+  if (chars > maxChars) failures.push(`${rel}: persona ${chars} chars exceeds budget ${maxChars}`)
+  if (tokens > maxEstTokens) failures.push(`${rel}: persona ~${tokens} est tokens exceeds budget ${maxEstTokens}`)
+  notes.push(`${rel}: persona ${chars} chars / ~${tokens} est tokens (budget ${maxChars}/${maxEstTokens})`)
+  return { failures, notes }
+}
+
+// 该相同的数份必须相同（kix 哲学：不是写死的 zh/en 一对）。
+// 边界自感知：preset 根 = 同时含 agent.cordis.yml + preset.yml 的目录（DSH preset
+// 布局双标记，压假阳性），深度 ≤2 扫描（跳过 .* / node_modules）。
+// 边界即 preset 根本身：非 preset 根路径天然出组，无需任何逐路径豁免规则。
+// 其它仓库：≥2 个 preset 根才引导；单 preset / 普通项目零开销放行——规则是负债，
+// 只做启发引导。
+const PRESET_MARKERS = ['agent.cordis.yml', 'preset.yml']
+
+function isPresetRootDir(root, rel) {
+  return PRESET_MARKERS.every((m) => fs.existsSync(path.join(root, rel, m)))
+}
+
+function discoverPresetRoots(root, extraRoots) {
+  if (!root || typeof root !== 'string') return []
+  const out = []
+  const add = (rel) => {
+    const n = String(rel || '').replace(/\\/g, '/').replace(/\/+$/, '')
+    if (!n || n.startsWith('..') || path.isAbsolute(n)) return
+    if (out.includes(n)) return
+    if (isPresetRootDir(root, n)) out.push(n)
+  }
+  for (const rel of (Array.isArray(extraRoots) ? extraRoots : [])) add(rel)
+  let top
+  try { top = fs.readdirSync(root, { withFileTypes: true }) } catch { return out.sort() }
+  for (const d1 of top) {
+    if (!d1.isDirectory() || d1.name.startsWith('.') || d1.name === 'node_modules') continue
+    add(d1.name)
+    let mid
+    try { mid = fs.readdirSync(path.join(root, d1.name), { withFileTypes: true }) } catch { continue }
+    for (const d2 of mid) {
+      if (!d2.isDirectory() || d2.name.startsWith('.')) continue
+      add(d1.name + '/' + d2.name)
+    }
+  }
+  return out.sort()
+}
+
+function isMultiPresetWorkspace(root) {
+  return discoverPresetRoots(root).length >= 2
+}
+
+// post-execute 注入合并：注入方先 `await next()` 拿下游 decision，再把自己的
+// contexts 并进去。裸返回 accept-decision 会短路瀑布、饿死后面挂载的监听器
+// （WSL2 实弹实锤：kix-discipline 注入后，后挂载的 kix-consistency 的 post
+// 永远收不到同一调用——首写提醒丢失）。非 accept 的下游 decision（block 等
+// 更强决定）原样放行不覆盖；下游无可合并对象时新建 accept。
+function appendContexts(decision, msgs) {
+  const list = Array.isArray(msgs) ? msgs.filter(Boolean) : []
+  if (list.length === 0) return decision
+  if (decision && typeof decision === 'object' && decision.kind && decision.kind !== 'accept') return decision
+  const base = decision && typeof decision === 'object' ? decision : {}
+  const prev = Array.isArray(base.additionalContexts) ? base.additionalContexts : []
+  return { ...base, kind: base.kind || 'accept', additionalContexts: [...prev, ...list] }
+}
+
+// 会话工作区根解析（kix-consistency / kix-guards 共用，防双源）：
+// 会话 header.cwd（DSH 官方口径：不可变 cwd 才是 workspace-write 边界）→
+// sandboxPolicy.resolve({session})（逐调用根）→ sandboxPolicy.workspaceRoot
+// （部署回退，常为 process.cwd()——误当会话工作区会让整套自感知静默失效，
+// WSL2 E2E 实锤）。全部拿不到 → null。
+function resolveWorkspaceRoot(agent, sandboxPolicy) {
+  try {
+    const cwd = agent && agent.session && agent.session.header && agent.session.header.cwd
+    if (typeof cwd === 'string' && cwd.length > 0) return cwd
+  } catch { /* fall through */ }
+  if (sandboxPolicy === undefined || sandboxPolicy === null) return null
+  if (typeof sandboxPolicy.resolve === 'function') {
+    try {
+      const session = agent && agent.session
+      const resolved = sandboxPolicy.resolve(session ? { session } : {})
+      if (resolved && typeof resolved.workspaceRoot === 'string' && resolved.workspaceRoot.length > 0) {
+        return resolved.workspaceRoot
+      }
+    } catch { /* fall through */ }
+  }
+  const fallback = sandboxPolicy.workspaceRoot
+  return typeof fallback === 'string' && fallback.length > 0 ? fallback : null
+}
+
+// paths ≥ 2；任一缺失 / 任一份与锚点（第一份）字节不同 → failure。
+function checkIdenticalSet({ root, paths, label }) {
+  const failures = []
+  const notes = []
+  const list = Array.isArray(paths) ? paths.filter(Boolean) : []
+  if (list.length < 2) return { failures: [`${label}: identity set needs ≥2 paths`], notes }
+  const missing = list.filter((p) => !fs.existsSync(path.join(root, p)))
+  if (missing.length) return { failures: missing.map((p) => `${p} missing`), notes }
+  const bufs = list.map((p) => fs.readFileSync(path.join(root, p)))
+  const differ = []
+  for (let i = 1; i < bufs.length; i++) {
+    if (!bufs[0].equals(bufs[i])) differ.push(list[i])
+  }
+  if (differ.length) {
+    failures.push(`${label}: ${list.length} copies not identical (${list[0]} differs from ${differ.join(', ')})`)
+  } else {
+    notes.push(`${label}: ${list.length} copies byte-identical`)
+  }
+  return { failures, notes }
+}
+
+// 两个目录声明为同一分发 Interface 时，文件集合和每个文件字节都必须一致。
+function checkMirrorTree({ root, left, right, label }) {
+  const failures = []
+  const notes = []
+  const leftDir = path.join(root, left)
+  const rightDir = path.join(root, right)
+  if (!fs.existsSync(leftDir) || !fs.existsSync(rightDir)) {
+    return { failures: [`${label}: mirror directory missing`], notes }
+  }
+  const relativeFiles = (dir) => walk(dir)
+    .map((file) => path.relative(dir, file).replace(/\\/g, '/'))
+    .sort()
+  const leftFiles = relativeFiles(leftDir)
+  const rightFiles = relativeFiles(rightDir)
+  const all = [...new Set([...leftFiles, ...rightFiles])].sort()
+  for (const rel of all) {
+    if (!leftFiles.includes(rel)) { failures.push(`${left}/${rel} missing`); continue }
+    if (!rightFiles.includes(rel)) { failures.push(`${right}/${rel} missing`); continue }
+    const result = checkIdenticalSet({ root, paths: [`${left}/${rel}`, `${right}/${rel}`], label: `${label}/${rel}` })
+    failures.push(...result.failures)
+  }
+  if (failures.length === 0) notes.push(`${label}: ${all.length} mirrored files byte-identical`)
+  return { failures, notes }
+}
+
+// 两文件是 N=2 的特例；保留给既有调用方。
+function checkFilesEqual({ root, a, b, label }) {
+  return checkIdenticalSet({ root, paths: [a, b], label })
+}
+
+// 从被写路径反推它属于哪个已发现的 preset 根（最长前缀）。
+function presetRootOf(rel, presetRoots) {
+  const p = String(rel || '').replace(/\\/g, '/')
+  let hit = null
+  for (const r of presetRoots) {
+    if (p === r || p.startsWith(r + '/')) {
+      if (!hit || r.length > hit.length) hit = r
+    }
+  }
+  return hit
+}
+
+// 身份组：同一相对路径在每个 preset 根下的对应文件。
+// 例：写 dsh/preset/plugins/x.js → [dsh/preset/plugins/x.js, en/preset/plugins/x.js]
+function identityPathsFor(rel, presetRoots) {
+  const p = String(rel || '').replace(/\\/g, '/')
+  const home = presetRootOf(p, presetRoots)
+  if (!home) return []
+  const suffix = p.slice(home.length).replace(/^\//, '')
+  return presetRoots.map((r) => (suffix ? r + '/' + suffix : r))
+}
+
+function pluginIdentityPaths(name, presetRoots) {
+  return (Array.isArray(presetRoots) ? presetRoots : []).map((r) => r + '/plugins/' + name)
+}
+
+// 变体身份组：不是「所有 preset 根同名文件必须是一份」。
+// 语言中立插件默认仍是发现到的全部根；下列插件按设计分簇——
+//   incentive 面 default+null 一对，classic zh+en 一对。
+// 写时拦截与 CI 全量共用，避免 runAllZh 豁免、checkPluginPair 全根硬绑的双源重复检查。
+// 组员按**变体名**声明（仓库目录名 → preset 名映射，未知目录名用自身兜底），
+// 不按仓库路径——同一张表在仓库布局（dsh/preset）与安装布局
+// （~/.dsh/.agent-presets/kixparadigm）下都成立。此前按路径声明时，
+// 安装布局下 group.filter 全部落空 → 回落「全根同名比对」→ 假失败。
+// 只认「本仓已知布局」：仓库相对路径（dsh/preset…）或安装布局目录名
+// （kixparadigm…）。未知根返回 null → 不并入任何簇（退回同名全根比对），
+// 避免外仓恰好叫 preset/ 就被绑进本仓变体簇。
+const VARIANT_NAME_BY_PATH = {
+  'dsh/preset': 'kixparadigm',
+  'dsh/preset-null': 'kixparadigm-null',
+  'dsh/preset-classic': 'kixparadigm-classic',
+  'en/preset-classic-en': 'kixparadigm-classic-en',
+}
+const VARIANT_NAMES = new Set(Object.values(VARIANT_NAME_BY_PATH))
+
+function presetVariantName(rel) {
+  const p = String(rel || '').replace(/\/+$/, '')
+  if (VARIANT_NAME_BY_PATH[p]) return VARIANT_NAME_BY_PATH[p]
+  const parts = p.split('/').filter(Boolean)
+  const base = parts.length ? parts[parts.length - 1] : ''
+  return VARIANT_NAMES.has(base) ? base : null
+}
+
+const PLUGIN_IDENTITY_GROUPS = {
+  'kix-budget.js': [
+    ['kixparadigm', 'kixparadigm-null'],
+    ['kixparadigm-classic', 'kixparadigm-classic-en'],
+  ],
+  'kix-probe.js': [['kixparadigm', 'kixparadigm-null']],
+  'kix-settle.js': [['kixparadigm', 'kixparadigm-null']],
+  'kix-mem.js': [['kixparadigm', 'kixparadigm-null']],
+  // 2026-09-09：webhook 桥是部署面规则层（GitHub 适配器 → webhookRuntime → kix 会话），
+  // 不属范式认知面 → 只比激励面两副本。classic/en 档不部署（其 composition 不挂
+  // webhookRuntime，多一份副本只会变成悬空行）。
+  'kix-webhook.js': [['kixparadigm', 'kixparadigm-null']],
+}
+
+function pluginSourceName(name) {
+  return String(name || '').replace(/\.test\.(js|cjs)$/, '.$1')
+}
+
+function isPluginTestFile(name) {
+  return /\.test\.(js|cjs)$/.test(String(name || ''))
+}
+
+// 测试文件只在「有伴侣源码」时才归一到 *.js：
+// 伴侣 = 已在 PLUGIN_IDENTITY_GROUPS，或任一 preset 根下存在对应源码。
+// 独立 smoke（如 kix4.test.js，磁盘上没有 kix4.js）保持自身名字，避免
+// s/.test.js/.js/ 把不存在的源码套进 4 根身份组。
+function pluginHasCompanionSource(name, { root, presetRoots } = {}) {
+  const source = pluginSourceName(name)
+  if (source === String(name || '')) return false
+  if (PLUGIN_IDENTITY_GROUPS[source]) return true
+  const roots = Array.isArray(presetRoots) ? presetRoots : []
+  if (!root || roots.length === 0) return false
+  return roots.some((r) => fs.existsSync(path.join(root, r, 'plugins', source)))
+}
+
+function pluginIdentityKey(name, opts) {
+  const n = String(name || '')
+  if (PLUGIN_IDENTITY_GROUPS[n]) return n
+  const source = pluginSourceName(n)
+  if (source !== n && (PLUGIN_IDENTITY_GROUPS[source] || pluginHasCompanionSource(n, opts))) return source
+  return n
+}
+
+function pluginIdentityGroups(name, presetRoots, root) {
+  const roots = Array.isArray(presetRoots) ? presetRoots : []
+  const key = pluginIdentityKey(name, { root, presetRoots: roots })
+  const spec = PLUGIN_IDENTITY_GROUPS[key]
+  if (!spec) return [roots.slice()]
+  const groups = spec
+    .map((group) => {
+      const wanted = group.map(presetVariantName)
+      return roots.filter((r) => wanted.includes(presetVariantName(r)))
+    })
+    .filter((group) => group.length > 0)
+  // 外仓根对不上本仓变体声明 → 退回同名全根比对，不把本仓分簇套到别人身上。
+  return groups.length > 0 ? groups : [roots.slice()]
+}
+
+function checkIdenticalGroup({ root, paths, label }) {
+  const list = Array.isArray(paths) ? paths.filter(Boolean) : []
+  if (list.length < 2) {
+    return {
+      failures: [],
+      notes: [`${label}: ${list.length} cop${list.length === 1 ? 'y' : 'ies'} (variant/opt-in), skipped`],
+    }
+  }
+  return checkIdenticalSet({ root, paths: list, label })
+}
+
+// 插件身份组：未点名的插件 = 每个已发现 preset 根下的同名文件；
+// 点名变体 = PLUGIN_IDENTITY_GROUPS 里的簇。未传 roots 则现场发现。
+// test 在该簇任一根存在则整簇校验；全无 test → note 跳过（如 opt-in kix-stalled）。
+function checkPluginPair({ root, name, presetRoots }) {
+  const roots = Array.isArray(presetRoots) && presetRoots.length ? presetRoots : discoverPresetRoots(root)
+  const key = pluginIdentityKey(name, { root, presetRoots: roots })
+  if (isPluginTestFile(name) && key === String(name || '')) {
+    return {
+      failures: [],
+      notes: [`plugins/${name}: independent test (no companion source), skipped`],
+    }
+  }
+  const sourceName = key
+  const groups = pluginIdentityGroups(sourceName, roots, root)
+  const failures = []
+  const notes = []
+  const testName = sourceName.replace(/\.(?:js|cjs)$/, '.test.js')
+  for (const group of groups) {
+    const out = checkIdenticalGroup({
+      root, paths: pluginIdentityPaths(sourceName, group), label: `plugins/${sourceName}`,
+    })
+    failures.push(...out.failures)
+    notes.push(...out.notes)
+    const testPaths = pluginIdentityPaths(testName, group)
+    const hasTest = testPaths.some((p) => fs.existsSync(path.join(root, p)))
+    if (!hasTest) {
+      notes.push(`plugins/${testName}: absent on all copies (opt-in), skipped`)
+      continue
+    }
+    const t = checkIdenticalGroup({
+      root, paths: testPaths, label: `plugins/${testName}`,
+    })
+    failures.push(...t.failures)
+    notes.push(...t.notes)
+  }
+  return { failures, notes }
+}
+
+// zh/en 包版本 + engines 一致（仓库级）
+function checkVersionPair({ root }) {
+  const failures = []
+  const notes = []
+  const zhText = read(root, 'package.json')
+  const enText = read(root, 'en/package.json')
+  if (zhText === null || enText === null) return { failures: ['package.json or en/package.json unreadable'], notes }
+  let zhPkg
+  let enPkg
+  try { zhPkg = JSON.parse(zhText) } catch { return { failures: ['package.json not valid JSON'], notes } }
+  try { enPkg = JSON.parse(enText) } catch { return { failures: ['en/package.json not valid JSON'], notes } }
+  if (zhPkg.version !== enPkg.version) failures.push(`zh/en package version mismatch: ${zhPkg.version} vs ${enPkg.version}`)
+  else notes.push(`zh/en package version consistent: ${zhPkg.version}`)
+  if (zhPkg.engines && zhPkg.engines.node !== '>=20.16.0') failures.push('package.json: engines.node should be >=20.16.0')
+  if (enPkg.engines && enPkg.engines.node !== '>=20.16.0') failures.push('en/package.json: engines.node should be >=20.16.0')
+  if (!failures.some((f) => f.includes('engines'))) notes.push('engines.node >=20.16.0 zh/en consistent')
+  return { failures, notes }
+}
+
+// en 包内版本检查（en 包无 zh 侧对照；expected 由调用方钉值——en/scripts 维持版本声明）
+function checkEnPkgVersion({ root, rel, expected }) {
+  const failures = []
+  const notes = []
+  const text = read(root, rel)
+  if (text === null) return { failures: [`${rel}: unreadable`], notes }
+  let pkg
+  try { pkg = JSON.parse(text) } catch { return { failures: [`${rel}: not valid JSON`], notes } }
+  if (pkg.version !== expected) failures.push(`${rel}: version should be ${expected}, got ${pkg.version}`)
+  else notes.push(`${rel}: version ${pkg.version}`)
+  if (!pkg.engines || pkg.engines.node !== '>=20.16.0') failures.push(`${rel}: engines.node should be >=20.16.0`)
+  else notes.push(`${rel}: engines.node >=20.16.0`)
+  return { failures, notes }
+}
+
+const RESIDENT_MEMBER_TOOLS = ['subagent_reviewer', 'subagent_qa', 'subagent_dev']
+
+function checkResidentMemberBindings({ root, rel }) {
+  const failures = []
+  const notes = []
+  const text = read(root, rel)
+  if (text === null) return { failures: [`${rel}: unreadable`], notes }
+  const lines = text.split(/\r?\n/)
+  for (const toolName of RESIDENT_MEMBER_TOOLS) {
+    const rows = lines
+      .map((line, index) => (new RegExp('^\\s+toolName:\\s*' + toolName + '\\s*$').test(line) ? index : -1))
+      .filter((index) => index >= 0)
+    if (rows.length !== 1) {
+      failures.push(`${rel}: expected exactly one ${toolName} tool row, got ${rows.length}`)
+      continue
+    }
+    const row = rows[0]
+    let start = row
+    while (start >= 0 && !/^\s*- id:\s*/.test(lines[start])) start--
+    let end = row + 1
+    while (end < lines.length && !/^\s*- id:\s*/.test(lines[end])) end++
+    const block = lines.slice(Math.max(0, start), end)
+    if (block.some((line) => /^\s+disabled:\s*true\s*$/.test(line))) {
+      failures.push(`${rel}: ${toolName} must be resident (remove disabled: true)`)
+    }
+  }
+  if (failures.length === 0) notes.push(`${rel}: reviewer/qa/dev are resident role-first members`)
+  return { failures, notes }
+}
+
+// subagent_cross is a capability contract, not a naming hint: the managed tool row must
+// stay bound to the non-degrading kix-route:cross sentinel, and the route plugin must
+// remain enabled. This closes the only configuration-drift path that could make
+// kix-settle overstate vendor independence after a successful same-vendor call.
+function checkCrossRouteBinding({ root, rel }) {
+  const failures = []
+  const notes = []
+  const text = read(root, rel)
+  if (text === null) return { failures: [rel + ': unreadable'], notes }
+  const lines = text.split(/\r?\n/)
+  const indentOf = (line) => (line.match(/^ */) || [''])[0].length
+  const entryBlock = (index, entryRe) => {
+    let start = index
+    while (start >= 0 && !entryRe.test(lines[start])) start--
+    if (start < 0) return []
+    const entryIndent = indentOf(lines[start])
+    let end = start + 1
+    while (end < lines.length) {
+      const line = lines[end]
+      if (line.trim() !== '' && !/^\s*#/.test(line)) {
+        const indent = indentOf(line)
+        if (indent < entryIndent || (indent === entryIndent && entryRe.test(line))) break
+      }
+      end++
+    }
+    return lines.slice(start, end)
+  }
+  const directChildIndex = (block, parentIndex, expected) => {
+    if (parentIndex < 0) return -1
+    const parentIndent = indentOf(block[parentIndex])
+    for (let index = parentIndex + 1; index < block.length; index++) {
+      const line = block[index]
+      if (line.trim() === '' || /^\s*#/.test(line)) continue
+      const indent = indentOf(line)
+      if (indent <= parentIndent) return -1
+      if (indent === parentIndent + 2 && line.trim() === expected) return index
+    }
+    return -1
+  }
+  const crossRows = lines
+    .map((line, index) => (/^\s+toolName:\s*subagent_cross\s*$/.test(line) ? index : -1))
+    .filter((index) => index >= 0)
+  if (crossRows.length !== 1) {
+    failures.push(rel + ': expected exactly one subagent_cross tool row, got ' + crossRows.length)
+  } else {
+    const block = entryBlock(crossRows[0], /^ {4}- id:\s*\S+/)
+    const toolIndent = block.length > 0 ? indentOf(block[0]) : -1
+    const configIndex = block.findIndex((line) =>
+      indentOf(line) === toolIndent + 2 && line.trim() === 'config:')
+    const agentOptionsIndex = directChildIndex(block, configIndex, 'agentOptions:')
+    const modelIndex = directChildIndex(block, agentOptionsIndex, 'model: kix-route:cross')
+    if (modelIndex < 0) {
+      failures.push(rel + ': subagent_cross must bind config.agentOptions.model to kix-route:cross')
+    }
+  }
+  const routeIndex = lines.findIndex((line) => /^- id:\s*kix-route\s*$/.test(line))
+  if (routeIndex < 0) {
+    failures.push(rel + ': enabled kix-route plugin row missing')
+  } else {
+    const block = entryBlock(routeIndex, /^- id:\s*\S+/)
+    if (!block.some((line) => /^ {2}name:\s*\.\/plugins\/kix-route\.js\s*$/.test(line)) ||
+        block.some((line) => /^ {2}disabled:\s*true\s*$/.test(line))) {
+      failures.push(rel + ': kix-route plugin must be enabled and load ./plugins/kix-route.js')
+    }
+  }
+  if (failures.length === 0) notes.push(rel + ': subagent_cross is bound to enabled kix-route:cross')
+  return { failures, notes }
+}
+
+// 本地 markdown 链接可达（相对链接目标；https/mailto/锚点跳过）
+function checkMarkdownLinks({ root, rel }) {
+  const failures = []
+  const notes = []
+  const dir = path.join(root, rel)
+  if (!fs.existsSync(dir)) return { failures: [`${rel} missing`], notes }
+  const bad = []
+  for (const file of walk(dir)) {
+    if (!file.endsWith('.md')) continue
+    const text = read(root, path.relative(root, file))
+    if (text === null) continue
+    const lines = text.split(/\r?\n/)
+    let fence = false
+    lines.forEach((line, index) => {
+      if (/^\s*```/.test(line)) { fence = !fence; return }
+      if (fence) return
+      const re = /\[[^\]]*\]\(([^)]*)\)/g
+      let m
+      while ((m = re.exec(line))) {
+        const url = m[1].trim()
+        if (/^(?:https?:|#|mailto:)/.test(url)) continue
+        const target = url.split('#')[0].trim()
+        if (!target || !/\.[A-Za-z0-9]+$/.test(target)) continue
+        const fromFile = path.resolve(path.dirname(file), target)
+        const fromRoot = path.resolve(dir, target)
+        if (!fs.existsSync(fromFile) && !fs.existsSync(fromRoot)) {
+          bad.push(`${path.relative(root, file)}:${index + 1} -> ${url}`)
+        }
+      }
+    })
+  }
+  if (bad.length) failures.push(`${rel}: ${bad.length} broken link(s): ${bad.join(' | ')}`)
+  else notes.push(`${rel}: all local markdown links reachable`)
+  return { failures, notes }
+}
+
+// 全量 JS/CJS/MJS 语法检查（walk + node --check）
+function checkSyntax({ root, rel, label }) {
+  const failures = []
+  const notes = []
+  const dir = path.join(root, rel)
+  if (!fs.existsSync(dir)) return { failures: [`${rel} missing`], notes }
+  const files = walk(dir).filter((f) => /\.(?:js|cjs|mjs)$/.test(f))
+  let bad = 0
+  for (const file of files) {
+    const r = spawnSync(process.execPath, ['--check', file], { encoding: 'utf8' })
+    if (r.status !== 0) { bad++; failures.push(`${label}: ${path.relative(root, file)} syntax check failed`) }
+  }
+  if (bad === 0) notes.push(`${label}: ${files.length} JS/CJS/MJS syntax OK`)
+  return { failures, notes }
+}
+
+// 单文件语法检查（写时增量用：只校验写入目标本身，不 walk 全目录）
+function checkFileSyntax({ root, rel, label }) {
+  const failures = []
+  const notes = []
+  const file = path.join(root, rel)
+  if (!fs.existsSync(file)) return { failures: [`${rel} missing`], notes }
+  const r = spawnSync(process.execPath, ['--check', file], { encoding: 'utf8' })
+  if (r.status !== 0) {
+    const firstLine = String(r.stderr || '').split('\n')[0]
+    failures.push(`${label || rel}: syntax check failed: ${firstLine || 'unknown error'}`)
+  } else {
+    notes.push(`${label || rel}: syntax OK`)
+  }
+  return { failures, notes }
+}
+
+function merge(...results) {
+  const failures = []
+  const notes = []
+  for (const r of results) {
+    if (r && r.failures) failures.push(...r.failures)
+    if (r && r.notes) notes.push(...r.notes)
+  }
+  return { failures, notes }
+}
+
+// 动态插件清单（dsh/preset/plugins/*.{js,cjs} 非 test——新增插件自动纳入，
+// 不维护硬编码清单；共享库 consistency-lib.cjs 也在同步检查范围：核心文件
+// 的 zh/en 漂移同样会被 checkPluginPair 拦截）
+function pluginNames(root) {
+  const dir = path.join(root, 'dsh/preset/plugins')
+  if (!fs.existsSync(dir)) return []
+  return fs.readdirSync(dir)
+    .filter((f) => /\.(?:js|cjs)$/.test(f) && !/\.test\.(?:js|cjs)$/.test(f))
+    .sort()
+}
+
+// ── 全量组装 ───────────────────────────────────────────────────────────────
+// zh 全量（仓库级：dsh/preset + en/preset + README + 副本 + 链接 + 语法）
+// 默认档共享货架（skills/agents）必须是指向 classic 的指针：仓库里是 symlink，
+// 或 Windows core.symlinks=false 检出成的文本指针；物化后的副本则是真目录。
+// 缺指针时「货架内相对链接可达」与安装期物化都无从成立，而实测删掉指针后
+// 其余门禁仍全绿——故在此机械钉住。
+const DEFAULT_SHELF_NAMES = ['skills', 'agents']
+
+function checkDefaultShelfPointers({ root, rel = 'dsh/preset' }) {
+  const failures = []
+  const notes = []
+  for (const name of DEFAULT_SHELF_NAMES) {
+    const p = path.join(root, rel, name)
+    let ok = false
+    try {
+      const st = fs.lstatSync(p)
+      if (st.isSymbolicLink()) {
+        ok = fs.statSync(p).isDirectory()
+      } else if (st.isDirectory()) {
+        ok = true
+      } else if (st.isFile() && st.size <= 256) {
+        const body = fs.readFileSync(p, 'utf8').trim()
+        const target = path.resolve(path.dirname(p), body)
+        ok = !/[\n\0]/.test(body) && fs.existsSync(target) && fs.statSync(target).isDirectory()
+      }
+    } catch {
+      ok = false
+    }
+    if (!ok) {
+      failures.push(`${rel}/${name}: 默认档共享货架指针缺失或不可解析（应为指向 preset-classic/${name} 的 symlink 或文本指针）`)
+    }
+  }
+  if (failures.length === 0) notes.push(`${rel}: 共享货架指针就位（${DEFAULT_SHELF_NAMES.join(', ')}）`)
+  return { failures, notes }
+}
+
+function runAllZh(root) {
+  return merge(
+    // v1.3.0 布局：默认 preset=激励面（含 disabled 经典 persona 遗产块）；classic 独立目录
+    // v1.3.4：预算单源 PERSONA_BUDGETS（原此处硬编码 6000/3400 与运行时插件 4500/2600 双源漂移）
+    checkPersonaBudget({ root, rel: 'dsh/preset/agent.cordis.yml', ...PERSONA_BUDGETS.zh }),
+    checkPersonaBudget({ root, rel: 'dsh/preset-classic/agent.cordis.yml', ...PERSONA_BUDGETS.zh }),
+    checkPersonaBudget({ root, rel: 'en/preset-classic-en/agent.cordis.yml', ...PERSONA_BUDGETS.en }),
+    ...['dsh/preset/agent.cordis.yml', 'dsh/preset-classic/agent.cordis.yml', 'dsh/preset-null/agent.cordis.yml', 'en/preset-classic-en/agent.cordis.yml']
+      .flatMap((rel) => [checkCrossRouteBinding({ root, rel }), checkResidentMemberBindings({ root, rel })]),
+    // 身份组由 checkPluginPair / PLUGIN_IDENTITY_GROUPS 单一事实源展开：
+    // 语言中立插件 4 根比对；budget 两簇、probe/settle/mem 仅 incentive 面。
+    ...pluginNames(root).map((name) => checkPluginPair({ root, name })),
+    checkVersionPair({ root }),
+    checkMirrorTree({ root, left: 'dsh/vision-bridge', right: 'en/bridge', label: 'vision-bridge' }),
+    checkIdenticalSet({ root, paths: ['scripts/install-lib.js', 'en/scripts/install-lib.js'], label: 'install-lib.js' }),
+    checkDefaultShelfPointers({ root }),
+    checkMarkdownLinks({ root, rel: 'dsh/preset' }),
+    checkMarkdownLinks({ root, rel: 'en/preset-classic-en' }),
+    checkSyntax({ root, rel: 'dsh/preset', label: 'dsh/preset' }),
+    checkSyntax({ root, rel: 'en/preset-classic-en', label: 'en/preset-classic-en' }),
+    checkSyntax({ root, rel: 'dsh/vision-bridge', label: 'dsh/vision-bridge' }),
+    checkSyntax({ root, rel: 'en/bridge', label: 'en/bridge' }),
+    checkSyntax({ root, rel: 'scripts', label: 'scripts' }),
+  )
+}
+
+// en 包全量（en 包内：preset + bridge + scripts；版本由调用方钉值）
+function runAllEn(root, expectedVersion) {
+  return merge(
+    checkPersonaBudget({ root, rel: 'preset-classic-en/agent.cordis.yml', ...PERSONA_BUDGETS.en }),
+    checkCrossRouteBinding({ root, rel: 'preset-classic-en/agent.cordis.yml' }),
+    checkResidentMemberBindings({ root, rel: 'preset-classic-en/agent.cordis.yml' }),
+    checkEnPkgVersion({ root, rel: 'package.json', expected: expectedVersion }),
+    checkMarkdownLinks({ root, rel: 'preset-classic-en' }),
+    checkSyntax({ root, rel: 'preset-classic-en', label: 'en/preset-classic-en' }),
+    checkSyntax({ root, rel: 'bridge', label: 'en/bridge' }),
+    checkSyntax({ root, rel: 'scripts', label: 'en/scripts' }),
+  )
+}
+
+module.exports = {
+  estimateTokens,
+  PERSONA_BUDGETS,
+  extractPersona,
+  checkPersonaBudget,
+  checkIdenticalSet,
+  checkMirrorTree,
+  PRESET_MARKERS,
+  checkDefaultShelfPointers,
+  DEFAULT_SHELF_NAMES,
+  discoverPresetRoots,
+  isMultiPresetWorkspace,
+  appendContexts,
+  resolveWorkspaceRoot,
+  presetRootOf,
+  identityPathsFor,
+  pluginIdentityPaths,
+  pluginIdentityGroups,
+  pluginIdentityKey,
+  pluginHasCompanionSource,
+  isPluginTestFile,
+  pluginSourceName,
+  PLUGIN_IDENTITY_GROUPS,
+  checkFilesEqual,
+  checkPluginPair,
+  checkVersionPair,
+  checkEnPkgVersion,
+  checkCrossRouteBinding,
+  checkResidentMemberBindings,
+  RESIDENT_MEMBER_TOOLS,
+  checkMarkdownLinks,
+  checkSyntax,
+  checkFileSyntax,
+  merge,
+  runAllZh,
+  runAllEn,
+  pluginNames,
+}
