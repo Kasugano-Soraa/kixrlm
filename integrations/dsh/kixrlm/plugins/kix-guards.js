@@ -45,6 +45,17 @@
 // 移植自 kixpower 的 blast-radius-check.ps1 / block-source-edit.ps1 核心门禁，
 // 以 DSH `tools/pre-execute` 监听器形态自动拦截（等价 Copilot PreToolUse hook）。
 //
+// v20（2026-10-10，用户实弹误报）：git commit 分支/预算检查接入 bash/pwsh 的
+//   workdir 参数。DSH 工具契约让模型「传 workdir 而不是 cd」（每次新 shell 无
+//   cwd 状态），worktree/多检出工作流的 commit 全走该路径；旧 resolveRepoRoot
+//   只解析命令文本（git -C / cd）与会话 cwd，workdir 提交一律落到会话 cwd
+//   仓库判分支——会话主检出停在 main 时（实测：/root/yilang 在 main +
+//   15 个 feature worktree 的标准工作流），feature 检出的正常 commit 被
+//   误判「main 直接 commit」硬 deny。修复：repoRootFromText（显式 -C/cd
+//   最先）> exec.arguments.workdir（相对路径按会话 cwd 解析，dsh-tool-bash
+//   resolveWorkdir 同语义）> 会话 cwd。denyMemo 终端键同步加 workdir 前缀：
+//   同命令文本在不同 workdir 是不同操作，不得复用「此前已被拒绝」。
+//
 // v2（2026-08-15）：补全 blast-radius 未接线门禁 —— commit budget、真实分支检查、
 // force push 完整检测、MCP GitHub 远程写保护、终端数据库客户端保守拦截、
 // UPDATE without WHERE、人类确认点 ask。
@@ -1181,9 +1192,25 @@ module.exports = {
         return undefined
       }
     }
+    // v20：bash/pwsh 的显式 workdir 参数（DSH 契约「传 workdir 而非 cd」）。
+    // 相对路径按会话 cwd 解析（dsh-tool-bash resolveWorkdir 同语义）。
+    function execWorkdir(exec) {
+      try {
+        const args = exec && (exec.arguments ?? exec.args)
+        const wd = args && typeof args === 'object' ? (args.workdir ?? args.cwd) : undefined
+        if (typeof wd !== 'string' || wd.length === 0) return undefined
+        if (wd.startsWith('/') || /^[A-Za-z]:[\\/]/.test(wd) || wd.startsWith('\\\\')) return wd
+        const base = agentCwd(exec)
+        return base ? join(base, wd) : wd
+      } catch {
+        return undefined
+      }
+    }
     function resolveRepoRoot(text, exec) {
       const fromText = repoRootFromText(text)
       if (fromText) return fromText
+      const wd = execWorkdir(exec)
+      if (wd) return wd
       const cwd = agentCwd(exec)
       if (cwd) return cwd
       return undefined
@@ -1330,8 +1357,12 @@ module.exports = {
       // 附原拒绝原因 + 禁止重复尝试，不再反复提问（堵「反复重复」反馈）。
       const pathArg = args && typeof (args.file_path ?? args.path) === 'string' ? (args.file_path ?? args.path) : undefined
       let memoKey = null
-      if (TERMINAL_TOOLS.has(tool) && text) memoKey = 'term::' + normalizeMemo(text)
-      else if (EDIT_TOOLS.has(tool) && pathArg) memoKey = 'edit::' + normalizeMemo(pathArg)
+      if (TERMINAL_TOOLS.has(tool) && text) {
+        // v20：终端 memo 键含 workdir——同命令文本在不同工作目录是不同操作，
+        // 一处被拒不启用「此前已被拒绝」短路另一处的独立判定。
+        const wdKey = execWorkdir(exec)
+        memoKey = 'term::' + (wdKey ? wdKey + '::' : '') + normalizeMemo(text)
+      } else if (EDIT_TOOLS.has(tool) && pathArg) memoKey = 'edit::' + normalizeMemo(pathArg)
       const ghCall = githubCallTarget(name, args, GH_RE)
       if (!memoKey && ghCall) memoKey = 'ghub::' + ghCall.name + '::' + stableArgs(ghCall.args)
       if (memoKey && denyMemo.has(memoKey)) {
