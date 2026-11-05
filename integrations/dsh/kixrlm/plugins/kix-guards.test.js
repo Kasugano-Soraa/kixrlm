@@ -627,6 +627,31 @@ async function softCase(label, name, args) {
     check('commit：会话 cwd≠仓库根 + cd 进入（无 -C）→ deny（v10 cd 解析 + 分支检查）', await dispatchIn(nonRepo, 'pwsh', { command: `cd ${gitRepo} && git commit -am "test"` }), true)
     check('commit：git -C 显式仓库 + main → deny（-C 解析路径不变）', await dispatchIn(nonRepo, 'pwsh', { command: `git -C ${gitRepo} commit -am "test"` }), true)
     check('commit：--work-tree 长 option 不吞掉子命令 → deny', await dispatchIn(gitRepo, 'pwsh', { command: `git --work-tree "${gitRepo}" commit -am "test"` }), true)
+    // v20 回归（2026-10-10 用户实弹）：DSH 契约「传 workdir 而非 cd」——
+    // worktree/多检出工作流的 commit 不带 -C/cd，旧 resolveRepoRoot 看不见
+    // workdir，一律落到会话 cwd 仓库判分支；会话主检出停在 main 时，feature
+    // 检出的正常 commit 被误判「main 直接 commit」硬 deny。
+    const featRepo = fsg.mkdtempSync(path.join(os.tmpdir(), 'kix-guards-feat-'))
+    git(['init', '-q'], featRepo)
+    git(['checkout', '-q', '-b', 'fix/demo'], featRepo)
+    git(['config', 'user.email', 'test@kix.local'], featRepo)
+    git(['config', 'user.name', 'kix-test'], featRepo)
+    fsg.writeFileSync(path.join(featRepo, 'a.txt'), 'x')
+    git(['add', 'a.txt'], featRepo)
+    git(['commit', '-qm', 'init'], featRepo)
+    check('commit：workdir=feature 检出 + 会话 cwd=main 仓库 → allow（v20 workdir 解析）', await dispatchIn(gitRepo, 'bash', { command: 'git commit -am "test"', workdir: featRepo }), false)
+    check('commit：workdir=main 仓库（会话 cwd 同仓）→ deny（保护不放松）', await dispatchIn(gitRepo, 'bash', { command: 'git commit -am "test"', workdir: gitRepo }), true)
+    check('commit：workdir=feature 检出 + pwsh → allow（同参数名跨终端工具）', await dispatchIn(gitRepo, 'pwsh', { command: 'git commit -am "test"', workdir: featRepo }), false)
+    check('commit：相对 workdir 按会话 cwd 解析 → allow（resolveWorkdir 同语义）', await dispatchIn(path.dirname(featRepo), 'bash', { command: 'git commit -am "test"', workdir: path.basename(featRepo) }), false)
+    // v20 memo 键含 workdir：同命令文本在不同 workdir 是不同操作，前者被拒
+    // 不得让后者直接吃「此前已被拒绝」——应按本 workdir 重新判定。
+    const memoFeat = await dispatchIn(gitRepo, 'bash', { command: 'git push --force', workdir: featRepo })
+    const memoOther = await dispatchIn(gitRepo, 'bash', { command: 'git push --force', workdir: gitRepo })
+    const memoOk = memoFeat && memoFeat.kind === 'deny' && memoOther && memoOther.kind === 'deny'
+      && /重写远端历史/.test(memoFeat.reason || '') && /重写远端历史/.test(memoOther.reason || '')
+      && !/此前已被拒绝/.test(memoOther.reason || '')
+    console.log(`${memoOk ? 'PASS' : 'FAIL'}  v20 memo：同文本不同 workdir → 各自独立判定（非「此前已被拒绝」）`)
+    memoOk ? passed++ : failed++
     check('commit：feature 分支 → allow（分支检查通过，预算冷启动 3 未超）', (async () => {
       git(['checkout', '-q', '-b', 'feature'], gitRepo)
       return dispatchIn(gitRepo, 'pwsh', { command: 'git commit -am "test"' })
